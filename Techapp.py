@@ -94,55 +94,68 @@ if uploaded_file is not None:
     # Filter out breaks to calculate pure working/productive hours from the filtered data
     work_df = filtered_df[filtered_df['Category'] != 'Break'].copy()
 
-    # --- DASHBOARD UI ---
-    st.markdown("---")
-    
-    # KPIs: Overall Team Metrics
-    st.header("🏆 Overall Team Productivity")
-    total_hours = work_df['Duration_Hours'].sum()
-    billable_hours = work_df[work_df['Category'] == 'Billable']['Duration_Hours'].sum()
-    non_billable_hours = work_df[work_df['Category'] == 'Non-Billable']['Duration_Hours'].sum()
-    
-    team_productivity = (billable_hours / total_hours * 100) if total_hours > 0 else 0
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Worked Hours", f"{total_hours:.1f} h")
-    col2.metric("Billable Hours", f"{billable_hours:.1f} h")
-    col3.metric("Non-Billable Hours", f"{non_billable_hours:.1f} h")
-    col4.metric("Team Productivity", f"{team_productivity:.1f} %")
-
-    st.markdown("---")
-
-    # Row 1: Technician Analysis
-    st.header("🧑‍🔧 Analysis by Technician")
-    
-    # Aggregate data by Technician
+    # --- PREPARE TECHNICIAN DATA ---
+    # Aggregate data by Technician first so we can use Expected Hours for Team KPIs
     tech_summary = work_df.groupby('Technicien').apply(
         lambda x: pd.Series({
-            'Total Hours': x['Duration_Hours'].sum(),
+            'Total Logged Hours': x['Duration_Hours'].sum(),
             'Billable Hours': x.loc[x['Category'] == 'Billable', 'Duration_Hours'].sum(),
-            'Non-Billable Hours': x.loc[x['Category'] == 'Non-Billable', 'Duration_Hours'].sum()
+            'Non-Billable Hours': x.loc[x['Category'] == 'Non-Billable', 'Duration_Hours'].sum(),
+            'Days Logged': x['Date_Parsed'].nunique()
         })
     ).reset_index()
     
+    # Calculate Expected and Unreported Hours (7.5 hours per active day)
+    tech_summary['Expected Hours'] = tech_summary['Days Logged'] * 7.5
+    tech_summary['Unreported Hours'] = np.maximum(0, tech_summary['Expected Hours'] - tech_summary['Total Logged Hours'])
+    
+    # Calculate Productivity against EXPECTED hours, not just logged hours
     tech_summary['Productivity (%)'] = np.where(
-        tech_summary['Total Hours'] > 0,
-        (tech_summary['Billable Hours'] / tech_summary['Total Hours']) * 100,
+        tech_summary['Expected Hours'] > 0,
+        (tech_summary['Billable Hours'] / tech_summary['Expected Hours']) * 100,
         0
     )
     
     # Sort for better visualization
     tech_summary = tech_summary.sort_values('Productivity (%)', ascending=False)
 
+    # --- DASHBOARD UI ---
+    st.markdown("---")
+    
+    # KPIs: Overall Team Metrics
+    st.header("🏆 Overall Team Productivity")
+    total_expected = tech_summary['Expected Hours'].sum()
+    total_logged = tech_summary['Total Logged Hours'].sum()
+    billable_hours = tech_summary['Billable Hours'].sum()
+    unreported_hours = tech_summary['Unreported Hours'].sum()
+    
+    # Team productivity based on expected hours
+    team_productivity = (billable_hours / total_expected * 100) if total_expected > 0 else 0
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Expected Hours", f"{total_expected:.1f} h")
+    col2.metric("Logged Hours", f"{total_logged:.1f} h")
+    col3.metric("Billable Hours", f"{billable_hours:.1f} h")
+    col4.metric("Unreported Hours", f"{unreported_hours:.1f} h")
+    col5.metric("Team Productivity", f"{team_productivity:.1f} %")
+
+    st.markdown("---")
+
+    # Row 1: Technician Analysis
+    st.header("🧑‍🔧 Analysis by Technician")
+
     col_chart1, col_chart2 = st.columns(2)
 
     with col_chart1:
         st.subheader("Hours Split by Technician")
-        # Melt the dataframe for plotting stacked bars
-        melted_tech = tech_summary.melt(id_vars='Technicien', value_vars=['Billable Hours', 'Non-Billable Hours'], 
+        # Melt the dataframe for plotting stacked bars (now including Unreported)
+        melted_tech = tech_summary.melt(id_vars='Technicien', 
+                                        value_vars=['Billable Hours', 'Non-Billable Hours', 'Unreported Hours'], 
                                         var_name='Hour Type', value_name='Hours')
+        
+        # Plotly chart with Unreported Hours shown in grey
         fig_hours = px.bar(melted_tech, x='Technicien', y='Hours', color='Hour Type',
-                           color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728'},
+                           color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728', 'Unreported Hours': '#7f7f7f'},
                            barmode='stack')
         st.plotly_chart(fig_hours, use_container_width=True)
 
@@ -157,9 +170,9 @@ if uploaded_file is not None:
 
     # Show data table
     with st.expander("View Detailed Technician Data"):
-        st.dataframe(tech_summary.style.format({
-            'Total Hours': '{:.2f}', 'Billable Hours': '{:.2f}', 
-            'Non-Billable Hours': '{:.2f}', 'Productivity (%)': '{:.2f}%'
+        st.dataframe(tech_summary[['Technicien', 'Days Logged', 'Expected Hours', 'Total Logged Hours', 'Billable Hours', 'Non-Billable Hours', 'Unreported Hours', 'Productivity (%)']].style.format({
+            'Expected Hours': '{:.2f}', 'Total Logged Hours': '{:.2f}', 'Billable Hours': '{:.2f}', 
+            'Non-Billable Hours': '{:.2f}', 'Unreported Hours': '{:.2f}', 'Productivity (%)': '{:.2f}%'
         }))
 
     st.markdown("---")
