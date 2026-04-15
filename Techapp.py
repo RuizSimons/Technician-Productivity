@@ -63,8 +63,36 @@ if uploaded_file is not None:
         else:
             df['Work_Order'] = 'No Work Order'
 
-        # Filter out breaks to calculate pure working/productive hours
-        work_df = df[df['Category'] != 'Break'].copy()
+        # 5. Extract Date components for filtering
+        df['Date_Parsed'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['Year'] = df['Date_Parsed'].dt.year.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
+        df['Month'] = df['Date_Parsed'].dt.month.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
+        df['Week'] = df['Date_Parsed'].dt.isocalendar().week.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
+
+    # --- SIDEBAR FILTERS ---
+    st.sidebar.header("📅 Date Filters")
+    st.sidebar.markdown("Keep as **Total** to view all records.")
+    
+    year_options = ['Total'] + sorted([y for y in df['Year'].unique() if y != 'Unknown'])
+    selected_year = st.sidebar.selectbox("Year", year_options)
+    
+    month_options = ['Total'] + sorted([m for m in df['Month'].unique() if m != 'Unknown'], key=lambda x: int(x))
+    selected_month = st.sidebar.selectbox("Month", month_options)
+    
+    week_options = ['Total'] + sorted([w for w in df['Week'].unique() if w != 'Unknown'], key=lambda x: int(x))
+    selected_week = st.sidebar.selectbox("Week", week_options)
+
+    # Apply Date Filters
+    filtered_df = df.copy()
+    if selected_year != 'Total':
+        filtered_df = filtered_df[filtered_df['Year'] == selected_year]
+    if selected_month != 'Total':
+        filtered_df = filtered_df[filtered_df['Month'] == selected_month]
+    if selected_week != 'Total':
+        filtered_df = filtered_df[filtered_df['Week'] == selected_week]
+
+    # Filter out breaks to calculate pure working/productive hours from the filtered data
+    work_df = filtered_df[filtered_df['Category'] != 'Break'].copy()
 
     # --- DASHBOARD UI ---
     st.markdown("---")
@@ -140,7 +168,7 @@ if uploaded_file is not None:
     st.header("📋 Analysis by Work Order (OR)")
     
     # Aggregate data by Work Order for Billable Hours only (or all hours based on requirement, showing all here)
-    wo_summary = df.groupby(['Work_Order', 'Category'])['Duration_Hours'].sum().reset_index()
+    wo_summary = filtered_df.groupby(['Work_Order', 'Category'])['Duration_Hours'].sum().reset_index()
     
     # Pivot to make it easier to read
     wo_pivot = wo_summary.pivot(index='Work_Order', columns='Category', values='Duration_Hours').fillna(0).reset_index()
