@@ -94,18 +94,39 @@ if uploaded_file is not None:
     # Filter out breaks to calculate pure working/productive hours from the filtered data
     work_df = filtered_df[filtered_df['Category'] != 'Break'].copy()
 
-    # Calculate global expected hours based on the calendar working days in the filtered period
-    if not filtered_df['Date_Parsed'].dropna().empty:
-        min_date = filtered_df['Date_Parsed'].min()
-        max_date = filtered_df['Date_Parsed'].max()
-        # Calculate business days (Monday-Friday) in the selected time range
-        business_days = np.busday_count(min_date.date(), max_date.date() + pd.Timedelta(days=1))
+    # Create a true calendar based on the absolute date range of the dataset to get accurate business days
+    if not df['Date_Parsed'].dropna().empty:
+        global_min = df['Date_Parsed'].min()
+        global_max = df['Date_Parsed'].max()
+        # Align to Monday (0) and Sunday (6) to guarantee full weeks
+        start_date = global_min - pd.to_timedelta(global_min.dayofweek, unit='d')
+        end_date = global_max + pd.to_timedelta(6 - global_max.dayofweek, unit='d')
+        
+        calendar_df = pd.DataFrame({'Date': pd.date_range(start=start_date, end=end_date)})
+        calendar_df['Year'] = calendar_df['Date'].dt.year.astype(str)
+        calendar_df['Month'] = calendar_df['Date'].dt.month.astype(str)
+        calendar_df['Week'] = calendar_df['Date'].dt.isocalendar().week.astype(str)
+        calendar_df['Is_Weekday'] = calendar_df['Date'].dt.dayofweek < 5
+        
+        # Apply the EXACT same filters to the true calendar
+        filtered_cal = calendar_df.copy()
+        if selected_year != 'Total':
+            filtered_cal = filtered_cal[filtered_cal['Year'] == selected_year]
+        if selected_month != 'Total':
+            filtered_cal = filtered_cal[filtered_cal['Month'] == selected_month]
+        if selected_week != 'Total':
+            filtered_cal = filtered_cal[filtered_cal['Week'] == selected_week]
+            
+        business_days = filtered_cal['Is_Weekday'].sum()
         expected_hours_baseline = float(business_days * 7.5)
     else:
         expected_hours_baseline = 0.0
 
     # --- PREPARE TECHNICIAN DATA ---
-    # Aggregate data by Technician first so we can use Expected Hours for Team KPIs
+    # 1. Get a master list of all technicians in the whole dataset
+    all_techs = df['Technicien'].dropna().unique()
+
+    # 2. Aggregate data by Technician for the filtered period
     tech_summary = work_df.groupby('Technicien').apply(
         lambda x: pd.Series({
             'Total Logged Hours': x['Duration_Hours'].sum(),
@@ -115,12 +136,16 @@ if uploaded_file is not None:
         })
     ).reset_index()
     
-    # Apply the global expected calendar hours to everyone (e.g., 37.5 for a full week)
+    # 3. Merge to ensure ALL technicians are present, even if they logged 0 hours this week!
+    tech_df = pd.DataFrame({'Technicien': all_techs})
+    tech_summary = pd.merge(tech_df, tech_summary, on='Technicien', how='left').fillna(0)
+    
+    # Apply the global expected calendar hours to everyone
     if not tech_summary.empty:
         tech_summary['Expected Hours'] = expected_hours_baseline
         tech_summary['Unreported Hours'] = np.maximum(0, tech_summary['Expected Hours'] - tech_summary['Total Logged Hours'])
         
-        # Calculate Productivity against EXPECTED hours, not just logged hours
+        # Calculate Productivity against EXPECTED hours
         tech_summary['Productivity (%)'] = np.where(
             tech_summary['Expected Hours'] > 0,
             (tech_summary['Billable Hours'] / tech_summary['Expected Hours']) * 100,
@@ -130,7 +155,7 @@ if uploaded_file is not None:
         # Sort for better visualization
         tech_summary = tech_summary.sort_values('Productivity (%)', ascending=False)
     else:
-        # Fallback if no data matches the filters
+        # Fallback
         tech_summary = pd.DataFrame(columns=['Technicien', 'Total Logged Hours', 'Billable Hours', 'Non-Billable Hours', 'Days Logged', 'Expected Hours', 'Unreported Hours', 'Productivity (%)'])
 
     # --- DASHBOARD UI ---
@@ -171,6 +196,10 @@ if uploaded_file is not None:
         fig_hours = px.bar(melted_tech, x='Technicien', y='Hours', color='Hour Type',
                            color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728', 'Unreported Hours': '#7f7f7f'},
                            barmode='stack')
+        
+        # Lock Y-axis dynamically based on expected hours or max logged hours to prevent jumping
+        max_y = max(expected_hours_baseline * 1.1, tech_summary['Total Logged Hours'].max() * 1.1) if expected_hours_baseline > 0 else 40
+        fig_hours.update_layout(yaxis=dict(range=[0, max_y]))
         st.plotly_chart(fig_hours, use_container_width=True)
 
     with col_chart2:
