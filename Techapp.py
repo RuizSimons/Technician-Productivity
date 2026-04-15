@@ -48,7 +48,7 @@ if uploaded_file is not None:
             code = str(row.get('Code', '')).strip()
             if code == '100':
                 return 'Break'
-            elif code == '20':
+            elif code in ['20', '30']:
                 return 'Billable'
             else:
                 return 'Non-Billable'
@@ -94,6 +94,16 @@ if uploaded_file is not None:
     # Filter out breaks to calculate pure working/productive hours from the filtered data
     work_df = filtered_df[filtered_df['Category'] != 'Break'].copy()
 
+    # Calculate global expected hours based on the calendar working days in the filtered period
+    if not filtered_df['Date_Parsed'].dropna().empty:
+        min_date = filtered_df['Date_Parsed'].min()
+        max_date = filtered_df['Date_Parsed'].max()
+        # Calculate business days (Monday-Friday) in the selected time range
+        business_days = np.busday_count(min_date.date(), max_date.date() + pd.Timedelta(days=1))
+        expected_hours_baseline = float(business_days * 7.5)
+    else:
+        expected_hours_baseline = 0.0
+
     # --- PREPARE TECHNICIAN DATA ---
     # Aggregate data by Technician first so we can use Expected Hours for Team KPIs
     tech_summary = work_df.groupby('Technicien').apply(
@@ -105,19 +115,23 @@ if uploaded_file is not None:
         })
     ).reset_index()
     
-    # Calculate Expected and Unreported Hours (7.5 hours per active day)
-    tech_summary['Expected Hours'] = tech_summary['Days Logged'] * 7.5
-    tech_summary['Unreported Hours'] = np.maximum(0, tech_summary['Expected Hours'] - tech_summary['Total Logged Hours'])
-    
-    # Calculate Productivity against EXPECTED hours, not just logged hours
-    tech_summary['Productivity (%)'] = np.where(
-        tech_summary['Expected Hours'] > 0,
-        (tech_summary['Billable Hours'] / tech_summary['Expected Hours']) * 100,
-        0
-    )
-    
-    # Sort for better visualization
-    tech_summary = tech_summary.sort_values('Productivity (%)', ascending=False)
+    # Apply the global expected calendar hours to everyone (e.g., 37.5 for a full week)
+    if not tech_summary.empty:
+        tech_summary['Expected Hours'] = expected_hours_baseline
+        tech_summary['Unreported Hours'] = np.maximum(0, tech_summary['Expected Hours'] - tech_summary['Total Logged Hours'])
+        
+        # Calculate Productivity against EXPECTED hours, not just logged hours
+        tech_summary['Productivity (%)'] = np.where(
+            tech_summary['Expected Hours'] > 0,
+            (tech_summary['Billable Hours'] / tech_summary['Expected Hours']) * 100,
+            0
+        )
+        
+        # Sort for better visualization
+        tech_summary = tech_summary.sort_values('Productivity (%)', ascending=False)
+    else:
+        # Fallback if no data matches the filters
+        tech_summary = pd.DataFrame(columns=['Technicien', 'Total Logged Hours', 'Billable Hours', 'Non-Billable Hours', 'Days Logged', 'Expected Hours', 'Unreported Hours', 'Productivity (%)'])
 
     # --- DASHBOARD UI ---
     st.markdown("---")
