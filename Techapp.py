@@ -359,6 +359,10 @@ else:
             ec6.metric("ERP Team Prod", f"{erp_team_prod:.1f} %")
 
             ec_chart1, ec_chart2 = st.columns(2)
+            
+            # Variable to capture clicked technicians from the chart
+            selected_techs_from_chart = []
+            
             with ec_chart1:
                 erp_melted = erp_summary.melt(id_vars='Tech_Name', value_vars=['Billable Hours', 'Non-Billable Hours', 'Unreported Hours'], var_name='Type', value_name='Hours')
                 fig_erp_hrs = px.bar(erp_melted, x='Tech_Name', y='Hours', color='Type', color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728', 'Unreported Hours': '#7f7f7f'}, barmode='stack')
@@ -369,7 +373,15 @@ else:
                 max_y_erp = max(erp_expected_hours_baseline * 1.1, max_worked * 1.1) if erp_expected_hours_baseline > 0 else 40
                 
                 fig_erp_hrs.update_layout(yaxis=dict(range=[0, max_y_erp]), title="Logged ERP Hours Split")
-                st.plotly_chart(fig_erp_hrs, use_container_width=True)
+                
+                # INTERACTIVE SELECTION (Tries to use modern Streamlit 1.35+ feature)
+                try:
+                    chart_event = st.plotly_chart(fig_erp_hrs, use_container_width=True, on_select="rerun")
+                    if chart_event and "selection" in chart_event and "points" in chart_event["selection"]:
+                        selected_techs_from_chart = list(set([p["x"] for p in chart_event["selection"]["points"]]))
+                except TypeError:
+                    # Fallback for older Streamlit versions
+                    st.plotly_chart(fig_erp_hrs, use_container_width=True)
 
             with ec_chart2:
                 fig_erp_prod = px.bar(erp_summary, x='Tech_Name', y='Productivity (%)', text=erp_summary['Productivity (%)'].apply(lambda x: f'{x:.1f}%'), color='Productivity (%)', color_continuous_scale='Greens')
@@ -380,7 +392,26 @@ else:
             # Detailed ERP Data Table
             st.markdown("---")
             st.subheader("📋 ERP Work Order Details")
-            wo_erp_summary = filtered_erp.groupby(['WO No.', 'Status_Label', 'Category'])[worked_col].sum().reset_index()
+            
+            # Initialize dropdown with technicians clicked on the chart (if any)
+            available_drill_techs = sorted(filtered_erp['Tech_Name'].dropna().unique())
+            default_selection = [t for t in selected_techs_from_chart if t in available_drill_techs]
+            
+            drill_down_techs = st.multiselect(
+                "🔎 Select Technician(s) to drill down into their Work Orders (or click the bars on the chart above!):",
+                options=available_drill_techs,
+                default=default_selection
+            )
+            
+            # Apply Drill Down Filter
+            if drill_down_techs:
+                wo_drill_df = filtered_erp[filtered_erp['Tech_Name'].isin(drill_down_techs)]
+                st.caption(f"Showing Work Orders for: **{', '.join(drill_down_techs)}**")
+            else:
+                wo_drill_df = filtered_erp
+                st.caption("Showing Work Orders for **ALL** technicians. Select a technician above to drill down.")
+
+            wo_erp_summary = wo_drill_df.groupby(['WO No.', 'Status_Label', 'Category'])[worked_col].sum().reset_index()
             
             # --- FIX: Use pivot_table instead of pivot to prevent duplicate/unhashable list errors ---
             if not wo_erp_summary.empty:
