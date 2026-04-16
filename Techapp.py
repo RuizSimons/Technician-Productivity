@@ -78,7 +78,8 @@ with st.spinner("Loading data..."):
             app_df['Date_Parsed'] = pd.to_datetime(app_df['Date'], errors='coerce')
             app_df['Year'] = app_df['Date_Parsed'].dt.year.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
             app_df['Month'] = app_df['Date_Parsed'].dt.month.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
-            app_df['Week'] = app_df['Date_Parsed'].dt.isocalendar().week.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
+            # Fix uint32 out of bounds error by safely casting to Int64 first
+            app_df['Week'] = app_df['Date_Parsed'].dt.isocalendar().week.astype('Int64').fillna(-1).astype(str).replace('-1', 'Unknown')
             
             available_years.update(app_df['Year'].unique())
             available_months.update(app_df['Month'].unique())
@@ -93,7 +94,8 @@ with st.spinner("Loading data..."):
             erp_df['Date_Parsed'] = pd.to_datetime(erp_df['Date'], errors='coerce')
             erp_df['Year'] = erp_df['Date_Parsed'].dt.year.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
             erp_df['Month'] = erp_df['Date_Parsed'].dt.month.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
-            erp_df['Week'] = erp_df['Date_Parsed'].dt.isocalendar().week.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
+            # Fix uint32 out of bounds error by safely casting to Int64 first
+            erp_df['Week'] = erp_df['Date_Parsed'].dt.isocalendar().week.astype('Int64').fillna(-1).astype(str).replace('-1', 'Unknown')
             
             available_years.update(erp_df['Year'].unique())
             available_months.update(erp_df['Month'].unique())
@@ -171,7 +173,7 @@ else:
                 cal_df = pd.DataFrame({'Date': pd.date_range(start=start_date, end=end_date)})
                 cal_df['Year'] = cal_df['Date'].dt.year.astype(str)
                 cal_df['Month'] = cal_df['Date'].dt.month.astype(str)
-                cal_df['Week'] = cal_df['Date'].dt.isocalendar().week.astype(str)
+                cal_df['Week'] = cal_df['Date'].dt.isocalendar().week.astype('Int64').astype(str)
                 cal_df['Is_Weekday'] = cal_df['Date'].dt.dayofweek < 5
                 
                 if selected_year != 'Total': cal_df = cal_df[cal_df['Year'] == selected_year]
@@ -251,7 +253,33 @@ else:
             worked_col = 'Time carried out' if 'Time carried out' in filtered_erp.columns else 'Duration'
             filtered_erp[worked_col] = pd.to_numeric(filtered_erp[worked_col], errors='coerce').fillna(0)
 
-            erp_summary = filtered_erp.groupby('Tech_Name').apply(
+            # Calendar Expected Hours Baseline for ERP
+            if not erp_df['Date_Parsed'].dropna().empty:
+                erp_min = erp_df['Date_Parsed'].min()
+                erp_max = erp_df['Date_Parsed'].max()
+                erp_start = erp_min - pd.to_timedelta(erp_min.dayofweek, unit='d')
+                erp_end = erp_max + pd.to_timedelta(6 - erp_max.dayofweek, unit='d')
+                
+                cal_erp_df = pd.DataFrame({'Date': pd.date_range(start=erp_start, end=erp_end)})
+                cal_erp_df['Year'] = cal_erp_df['Date'].dt.year.astype(str)
+                cal_erp_df['Month'] = cal_erp_df['Date'].dt.month.astype(str)
+                cal_erp_df['Week'] = cal_erp_df['Date'].dt.isocalendar().week.astype('Int64').astype(str)
+                cal_erp_df['Is_Weekday'] = cal_erp_df['Date'].dt.dayofweek < 5
+                
+                if selected_year != 'Total': cal_erp_df = cal_erp_df[cal_erp_df['Year'] == selected_year]
+                if selected_month != 'Total': cal_erp_df = cal_erp_df[cal_erp_df['Month'] == selected_month]
+                if selected_week != 'Total': cal_erp_df = cal_erp_df[cal_erp_df['Week'] == selected_week]
+                
+                erp_expected_hours_baseline = float(cal_erp_df['Is_Weekday'].sum() * 7.5)
+            else:
+                erp_expected_hours_baseline = 0.0
+
+            # Master list of techs (Mapped techs + any unexpected techs found in the file)
+            known_techs = list(TECH_MAPPING.values())
+            found_techs = filtered_erp['Tech_Name'].dropna().unique().tolist()
+            all_erp_techs = pd.DataFrame({'Tech_Name': list(set(known_techs + found_techs))})
+
+            erp_summary_raw = filtered_erp.groupby('Tech_Name').apply(
                 lambda x: pd.Series({
                     'Total Hours Worked': x[worked_col].sum(),
                     'Billable Hours': x.loc[x['Category'] == 'Billable', worked_col].sum(),
@@ -259,8 +287,15 @@ else:
                 })
             ).reset_index()
 
+            # Merge to ensure techs who logged 0 hours appear
+            erp_summary = pd.merge(all_erp_techs, erp_summary_raw, on='Tech_Name', how='left').fillna(0)
+
+            # Assign Expected and Unreported Hours
+            erp_summary['Expected Hours'] = erp_expected_hours_baseline
+            erp_summary['Unreported Hours'] = np.maximum(0, erp_summary['Expected Hours'] - erp_summary['Total Hours Worked'])
+
             # --- OFFICIAL PRODUCTIVITY CALCULATION (From PDF) ---
-            # Formula: Billable Hours / Hours Worked
+            # Formula remains strictly: Billable Hours / Hours Worked
             erp_summary['Productivity (%)'] = np.where(
                 erp_summary['Total Hours Worked'] > 0,
                 (erp_summary['Billable Hours'] / erp_summary['Total Hours Worked']) * 100,
@@ -269,24 +304,30 @@ else:
             erp_summary = erp_summary.sort_values('Productivity (%)', ascending=False)
 
             st.subheader("🏆 ERP Data - Official Productivity (PDF Standard)")
-            st.caption("ℹ️ *Note: ERP Productivity is calculated purely as (Billable Hours / Total Logged Hours Worked) based on the official PDF document, ignoring empty days.*")
+            st.caption("ℹ️ *Note: ERP Productivity is calculated purely as (Billable Hours / Total Logged Hours Worked) based on the official PDF document. Unreported hours are visualized below for the 'complete picture' but do not reduce the PDF productivity score.*")
             
             erp_total_worked = erp_summary['Total Hours Worked'].sum()
+            erp_total_expected = erp_summary['Expected Hours'].sum()
             erp_billable = erp_summary['Billable Hours'].sum()
             erp_non_billable = erp_summary['Non-Billable Hours'].sum()
+            erp_unreported = erp_summary['Unreported Hours'].sum()
             erp_team_prod = (erp_billable / erp_total_worked * 100) if erp_total_worked > 0 else 0
 
-            ec1, ec2, ec3, ec4 = st.columns(4)
-            ec1.metric("Total Hours Worked (ERP)", f"{erp_total_worked:.1f} h")
-            ec2.metric("Billable Hours (ERP)", f"{erp_billable:.1f} h")
-            ec3.metric("Non-Billable (ERP)", f"{erp_non_billable:.1f} h")
-            ec4.metric("ERP Team Productivity", f"{erp_team_prod:.1f} %")
+            ec1, ec2, ec3, ec4, ec5, ec6 = st.columns(6)
+            ec1.metric("Expected Hours", f"{erp_total_expected:.1f} h")
+            ec2.metric("Hours Worked (ERP)", f"{erp_total_worked:.1f} h")
+            ec3.metric("Billable (ERP)", f"{erp_billable:.1f} h")
+            ec4.metric("Non-Billable (ERP)", f"{erp_non_billable:.1f} h")
+            ec5.metric("Unreported", f"{erp_unreported:.1f} h")
+            ec6.metric("ERP Team Prod", f"{erp_team_prod:.1f} %")
 
             ec_chart1, ec_chart2 = st.columns(2)
             with ec_chart1:
-                erp_melted = erp_summary.melt(id_vars='Tech_Name', value_vars=['Billable Hours', 'Non-Billable Hours'], var_name='Type', value_name='Hours')
-                fig_erp_hrs = px.bar(erp_melted, x='Tech_Name', y='Hours', color='Type', color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728'}, barmode='stack')
-                fig_erp_hrs.update_layout(title="Logged ERP Hours Split")
+                erp_melted = erp_summary.melt(id_vars='Tech_Name', value_vars=['Billable Hours', 'Non-Billable Hours', 'Unreported Hours'], var_name='Type', value_name='Hours')
+                fig_erp_hrs = px.bar(erp_melted, x='Tech_Name', y='Hours', color='Type', color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728', 'Unreported Hours': '#7f7f7f'}, barmode='stack')
+                
+                max_y_erp = max(erp_expected_hours_baseline * 1.1, erp_summary['Total Hours Worked'].max() * 1.1) if erp_expected_hours_baseline > 0 else 40
+                fig_erp_hrs.update_layout(yaxis=dict(range=[0, max_y_erp]), title="Logged ERP Hours Split")
                 st.plotly_chart(fig_erp_hrs, use_container_width=True)
 
             with ec_chart2:
