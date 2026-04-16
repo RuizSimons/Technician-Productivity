@@ -196,7 +196,7 @@ else:
                 if selected_month != 'Total': cal_df = cal_df[cal_df['Month'] == selected_month]
                 if selected_week != 'Total': cal_df = cal_df[cal_df['Week'] == selected_week]
                 
-                expected_hours_baseline = float(cal_df['Is_Weekday'].sum() * 7.5)
+                expected_hours_baseline = float(cal_df['Is_Weekday'].sum() * 7.0)
             else:
                 expected_hours_baseline = 0.0
 
@@ -215,16 +215,18 @@ else:
             if not app_summary.empty:
                 app_summary['Expected Hours'] = expected_hours_baseline
                 app_summary['Unreported Hours'] = np.maximum(0, app_summary['Expected Hours'] - app_summary['Total Logged Hours'])
-                app_summary['Productivity (%)'] = np.where(app_summary['Expected Hours'] > 0, (app_summary['Billable Hours'] / app_summary['Expected Hours']) * 100, 0)
+                app_summary['Effective Total Hours'] = app_summary['Total Logged Hours'] + app_summary['Unreported Hours']
+                app_summary['Productivity (%)'] = np.where(app_summary['Effective Total Hours'] > 0, (app_summary['Billable Hours'] / app_summary['Effective Total Hours']) * 100, 0)
                 app_summary = app_summary.sort_values('Productivity (%)', ascending=False)
             
             # App UI
             st.subheader("🏆 App Data - Overall Team Productivity (Expected vs Logged)")
             total_exp = app_summary['Expected Hours'].sum()
             total_log = app_summary['Total Logged Hours'].sum()
+            total_effective = app_summary['Effective Total Hours'].sum() if not app_summary.empty else 0
             bill_hrs = app_summary['Billable Hours'].sum()
             unrep_hrs = app_summary['Unreported Hours'].sum()
-            app_prod = (bill_hrs / total_exp * 100) if total_exp > 0 else 0
+            app_prod = (bill_hrs / total_effective * 100) if total_effective > 0 else 0
 
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Expected Hours", f"{total_exp:.1f} h")
@@ -287,7 +289,7 @@ else:
                 if selected_month != 'Total': cal_erp_df = cal_erp_df[cal_erp_df['Month'] == selected_month]
                 if selected_week != 'Total': cal_erp_df = cal_erp_df[cal_erp_df['Week'] == selected_week]
                 
-                erp_expected_hours_baseline = float(cal_erp_df['Is_Weekday'].sum() * 7.5)
+                erp_expected_hours_baseline = float(cal_erp_df['Is_Weekday'].sum() * 7.0)
             else:
                 erp_expected_hours_baseline = 0.0
 
@@ -311,25 +313,27 @@ else:
             # Assign Expected and Unreported Hours
             erp_summary['Expected Hours'] = erp_expected_hours_baseline
             erp_summary['Unreported Hours'] = np.maximum(0, erp_summary['Expected Hours'] - erp_summary['Total Hours Worked'])
+            erp_summary['Effective Total Hours'] = erp_summary['Total Hours Worked'] + erp_summary['Unreported Hours']
 
-            # --- OFFICIAL PRODUCTIVITY CALCULATION (From PDF) ---
-            # Formula remains strictly: Billable Hours / Hours Worked
+            # --- CUSTOM PRODUCTIVITY CALCULATION (Adapted from PDF) ---
+            # Formula adapted: Billable Hours / (Total Hours Worked + Unreported Hours)
             erp_summary['Productivity (%)'] = np.where(
-                erp_summary['Total Hours Worked'] > 0,
-                (erp_summary['Billable Hours'] / erp_summary['Total Hours Worked']) * 100,
+                erp_summary['Effective Total Hours'] > 0,
+                (erp_summary['Billable Hours'] / erp_summary['Effective Total Hours']) * 100,
                 0
             )
             erp_summary = erp_summary.sort_values('Productivity (%)', ascending=False)
 
-            st.subheader("🏆 ERP Data - Official Productivity (PDF Standard)")
-            st.caption("ℹ️ *Note: ERP Productivity is calculated purely as (Billable Hours / Total Logged Hours Worked) based on the official PDF document. Unreported hours are visualized below for the 'complete picture' but do not reduce the PDF productivity score.*")
+            st.subheader("🏆 ERP Data - Adjusted Productivity (Includes Unreported)")
+            st.caption("ℹ️ *Note: To address under-reporting, the official PDF formula has been adapted. Unreported hours are effectively treated as non-billable time. Productivity = Billable Hours / (Logged Hours + Unreported Hours). Overtime increases the total hours for the day.*")
             
             erp_total_worked = erp_summary['Total Hours Worked'].sum()
             erp_total_expected = erp_summary['Expected Hours'].sum()
+            erp_total_effective = erp_summary['Effective Total Hours'].sum()
             erp_billable = erp_summary['Billable Hours'].sum()
             erp_non_billable = erp_summary['Non-Billable Hours'].sum()
             erp_unreported = erp_summary['Unreported Hours'].sum()
-            erp_team_prod = (erp_billable / erp_total_worked * 100) if erp_total_worked > 0 else 0
+            erp_team_prod = (erp_billable / erp_total_effective * 100) if erp_total_effective > 0 else 0
 
             ec1, ec2, ec3, ec4, ec5, ec6 = st.columns(6)
             ec1.metric("Expected Hours", f"{erp_total_expected:.1f} h")
