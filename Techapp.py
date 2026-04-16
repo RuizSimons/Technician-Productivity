@@ -12,6 +12,7 @@ TECH_MAPPING = {
     5: "MICHEL FLORENTINE",
     8: "DITLANE JACOBS",
     11: "NAILI SAMIR",
+    15: "MATTHIEU DERAIN",
     16: "JUNO CARVAJAL",
     17: "PAOLO RAMOS",
     18: "IBAN OBANDO",
@@ -68,6 +69,7 @@ erp_file = st.sidebar.file_uploader("2. Upload ERP Report", type=["xlsx", "csv"]
 app_df = None
 erp_df = None
 available_years, available_months, available_weeks = set(), set(), set()
+available_techs = set()
 
 # --- LOAD DATA & EXTRACT DATES FOR UNIFIED FILTERS ---
 with st.spinner("Loading data..."):
@@ -84,6 +86,7 @@ with st.spinner("Loading data..."):
             available_years.update(app_df['Year'].unique())
             available_months.update(app_df['Month'].unique())
             available_weeks.update(app_df['Week'].unique())
+            available_techs.update(app_df['Technicien'].dropna().unique())
         except Exception as e:
             st.sidebar.error(f"Error loading App data: {e}")
 
@@ -97,9 +100,13 @@ with st.spinner("Loading data..."):
             # Fix uint32 out of bounds error by safely casting to Int64 first
             erp_df['Week'] = erp_df['Date_Parsed'].dt.isocalendar().week.astype('Int64').fillna(-1).astype(str).replace('-1', 'Unknown')
             
+            # Map ERP tech names immediately so we can use them in the global filter
+            erp_df['Tech_Name'] = erp_df['Shre Salarie'].map(TECH_MAPPING).fillna(erp_df['Shre Salarie'].astype(str) + " (Unknown Name)")
+
             available_years.update(erp_df['Year'].unique())
             available_months.update(erp_df['Month'].unique())
             available_weeks.update(erp_df['Week'].unique())
+            available_techs.update(erp_df['Tech_Name'].dropna().unique())
         except Exception as e:
             st.sidebar.error(f"Error loading ERP data: {e}")
 
@@ -116,6 +123,14 @@ selected_month = st.sidebar.selectbox("Month", month_options)
 
 week_options = ['Total'] + sorted([w for w in available_weeks if w != 'Unknown'], key=lambda x: int(x))
 selected_week = st.sidebar.selectbox("Week", week_options)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🧑‍🔧 Technician Filters")
+excluded_techs = st.sidebar.multiselect(
+    "Exclude Technicians", 
+    options=sorted(list(available_techs)),
+    help="Select technicians to exclude from calculations (e.g., borrowed from other branches)."
+)
 
 # --- MAIN DASHBOARD AREA ---
 if app_df is None and erp_df is None:
@@ -160,6 +175,7 @@ else:
             if selected_year != 'Total': filtered_app = filtered_app[filtered_app['Year'] == selected_year]
             if selected_month != 'Total': filtered_app = filtered_app[filtered_app['Month'] == selected_month]
             if selected_week != 'Total': filtered_app = filtered_app[filtered_app['Week'] == selected_week]
+            if excluded_techs: filtered_app = filtered_app[~filtered_app['Technicien'].isin(excluded_techs)]
 
             work_app_df = filtered_app[filtered_app['Category'] != 'Break'].copy()
 
@@ -184,7 +200,8 @@ else:
             else:
                 expected_hours_baseline = 0.0
 
-            all_techs = app_df['Technicien'].dropna().unique()
+            # Exclude them from the master technician list so they do not show up as 0 hours
+            all_techs = [t for t in app_df['Technicien'].dropna().unique() if t not in excluded_techs]
             app_summary = work_app_df.groupby('Technicien').apply(
                 lambda x: pd.Series({
                     'Total Logged Hours': x['Duration_Hours'].sum(),
@@ -243,9 +260,9 @@ else:
             if selected_year != 'Total': filtered_erp = filtered_erp[filtered_erp['Year'] == selected_year]
             if selected_month != 'Total': filtered_erp = filtered_erp[filtered_erp['Month'] == selected_month]
             if selected_week != 'Total': filtered_erp = filtered_erp[filtered_erp['Week'] == selected_week]
+            if excluded_techs: filtered_erp = filtered_erp[~filtered_erp['Tech_Name'].isin(excluded_techs)]
 
             # Apply Mappings
-            filtered_erp['Tech_Name'] = filtered_erp['Shre Salarie'].map(TECH_MAPPING).fillna(filtered_erp['Shre Salarie'].astype(str) + " (Unknown Name)")
             filtered_erp['Status_Label'] = filtered_erp['Status'].map(WO_STATUS_MAPPING).fillna(filtered_erp['Status'].astype(str))
             filtered_erp['Category'] = filtered_erp.apply(classify_erp_hours, axis=1)
             
@@ -274,10 +291,11 @@ else:
             else:
                 erp_expected_hours_baseline = 0.0
 
-            # Master list of techs (Mapped techs + any unexpected techs found in the file)
+            # Master list of techs (Mapped techs + any unexpected techs found in the file), minus exclusions
             known_techs = list(TECH_MAPPING.values())
             found_techs = filtered_erp['Tech_Name'].dropna().unique().tolist()
-            all_erp_techs = pd.DataFrame({'Tech_Name': list(set(known_techs + found_techs))})
+            combined_techs = [t for t in list(set(known_techs + found_techs)) if t not in excluded_techs]
+            all_erp_techs = pd.DataFrame({'Tech_Name': combined_techs})
 
             erp_summary_raw = filtered_erp.groupby('Tech_Name').apply(
                 lambda x: pd.Series({
