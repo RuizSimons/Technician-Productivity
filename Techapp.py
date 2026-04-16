@@ -210,6 +210,11 @@ else:
                 })
             ).reset_index()
             
+            # --- FIX: Ensure columns exist even if the filtered data is completely empty ---
+            for col in ['Total Logged Hours', 'Billable Hours', 'Non-Billable Hours']:
+                if col not in app_summary.columns:
+                    app_summary[col] = 0.0
+
             app_summary = pd.merge(pd.DataFrame({'Technicien': all_techs}), app_summary, on='Technicien', how='left').fillna(0)
             
             if not app_summary.empty:
@@ -239,7 +244,12 @@ else:
             with c_chart1:
                 melted = app_summary.melt(id_vars='Technicien', value_vars=['Billable Hours', 'Non-Billable Hours', 'Unreported Hours'], var_name='Type', value_name='Hours')
                 fig_hrs = px.bar(melted, x='Technicien', y='Hours', color='Type', color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728', 'Unreported Hours': '#7f7f7f'}, barmode='stack')
-                max_y = max(expected_hours_baseline * 1.1, app_summary['Total Logged Hours'].max() * 1.1) if expected_hours_baseline > 0 else 40
+                
+                # --- FIX: Safe max calculation for empty dataframes ---
+                max_logged = app_summary['Total Logged Hours'].max() if not app_summary.empty else 0
+                max_logged = 0 if pd.isna(max_logged) else max_logged
+                max_y = max(expected_hours_baseline * 1.1, max_logged * 1.1) if expected_hours_baseline > 0 else 40
+                
                 fig_hrs.update_layout(yaxis=dict(range=[0, max_y]), title="Hours Split by Technician")
                 st.plotly_chart(fig_hrs, use_container_width=True)
 
@@ -307,6 +317,11 @@ else:
                 })
             ).reset_index()
 
+            # --- FIX: Ensure columns exist even if the filtered data is completely empty ---
+            for col in ['Total Hours Worked', 'Billable Hours', 'Non-Billable Hours']:
+                if col not in erp_summary_raw.columns:
+                    erp_summary_raw[col] = 0.0
+
             # Merge to ensure techs who logged 0 hours appear
             erp_summary = pd.merge(all_erp_techs, erp_summary_raw, on='Tech_Name', how='left').fillna(0)
 
@@ -348,7 +363,11 @@ else:
                 erp_melted = erp_summary.melt(id_vars='Tech_Name', value_vars=['Billable Hours', 'Non-Billable Hours', 'Unreported Hours'], var_name='Type', value_name='Hours')
                 fig_erp_hrs = px.bar(erp_melted, x='Tech_Name', y='Hours', color='Type', color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728', 'Unreported Hours': '#7f7f7f'}, barmode='stack')
                 
-                max_y_erp = max(erp_expected_hours_baseline * 1.1, erp_summary['Total Hours Worked'].max() * 1.1) if erp_expected_hours_baseline > 0 else 40
+                # --- FIX: Safe max calculation for empty dataframes ---
+                max_worked = erp_summary['Total Hours Worked'].max() if not erp_summary.empty else 0
+                max_worked = 0 if pd.isna(max_worked) else max_worked
+                max_y_erp = max(erp_expected_hours_baseline * 1.1, max_worked * 1.1) if erp_expected_hours_baseline > 0 else 40
+                
                 fig_erp_hrs.update_layout(yaxis=dict(range=[0, max_y_erp]), title="Logged ERP Hours Split")
                 st.plotly_chart(fig_erp_hrs, use_container_width=True)
 
@@ -362,7 +381,12 @@ else:
             st.markdown("---")
             st.subheader("📋 ERP Work Order Details")
             wo_erp_summary = filtered_erp.groupby(['WO No.', 'Status_Label', 'Category'])[worked_col].sum().reset_index()
-            wo_erp_pivot = wo_erp_summary.pivot(index=['WO No.', 'Status_Label'], columns='Category', values=worked_col).fillna(0).reset_index()
+            
+            # --- FIX: Use pivot_table instead of pivot to prevent duplicate/unhashable list errors ---
+            if not wo_erp_summary.empty:
+                wo_erp_pivot = wo_erp_summary.pivot_table(index=['WO No.', 'Status_Label'], columns='Category', values=worked_col, aggfunc='sum').fillna(0).reset_index()
+            else:
+                wo_erp_pivot = pd.DataFrame(columns=['WO No.', 'Status_Label', 'Billable', 'Non-Billable'])
             
             for col in ['Billable', 'Non-Billable']:
                 if col not in wo_erp_pivot.columns: wo_erp_pivot[col] = 0
