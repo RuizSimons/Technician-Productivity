@@ -1,10 +1,31 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
+"""
+360 Technician Productivity Dashboard - v2
+==========================================
+Changes vs v1:
+  * AUTO-DETECT: one uploader, drop both files in any order. The app fingerprints
+    each file by its columns and assigns it to the App or ERP slot itself.
+  * VALIDATION PANEL: every file gets a green/red report before it is used.
+  * FOOTER STRIP: Irium exports carry trailing summary rows ("Duration",
+    "Number of records", blanks). These are removed automatically.
+  * NAME NORMALISATION: "BOISSEAU Nicolas" (app) and "NICOLAS BOISSEAU" (ERP
+    mapping) are now recognised as the same person -> filters and comparison work.
+  * BILLABLE FIX: v1 classified every ERP row as Billable because the Hour Type
+    test ("MAIN D'OEUVRE") fired before the Group test, and Group was a float
+    ("100.0") so it never matched the string list. Group is now the primary rule.
+  * COMPARISON TAB: app-declared hours vs ERP-booked hours per technician.
+"""
 
-# --- MAPPINGS FROM SCREENSHOTS ---
-# You can easily add or edit these mappings based on your exact ERP data.
+import re
+import unicodedata
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION - edit these when staff or ERP codes change
+# ----------------------------------------------------------------------------
 
 TECH_MAPPING = {
     2: "DILROY SEEBALACK",
@@ -12,6 +33,7 @@ TECH_MAPPING = {
     5: "MICHEL FLORENTINE",
     8: "DITLANE JACOBS",
     11: "NAILI SAMIR",
+    13: "HESTON ANSON",
     15: "MATTHIEU DERAIN",
     16: "JUNO CARVAJAL",
     17: "PAOLO RAMOS",
@@ -24,405 +46,483 @@ TECH_MAPPING = {
 
 WO_STATUS_MAPPING = {
     "AC": "QUOTE ACCEPTED",
-    "EC": "TO INVOICE",
     "AP": "TO INVOICE PARTIALLY",
     "CP": "IN ACCOUNTING",
     "DE": "QUOTE PRINTED",
     "EC": "IN PROGRESS",
-    "ED": "DEVIS EDITE",
+    "ED": "QUOTE EDITED",
     "FC": "INVOICED",
     "RE": "QUOTE REFUSED",
-    "TE": "DEVIS TERMINE",
+    "TE": "QUOTE COMPLETED",
     "TP": "FINISHED PARTIALLY",
-    "TR": "QUOTE TRANSFERRED TO ORD",
+    "TR": "QUOTE TRANSFERRED TO ORDER",
     "TT": "TOTALLY FINISHED",
-
-    # Add other statuses as needed
 }
 
-def classify_erp_hours(row):
-    """
-    Classifies ERP hours into Billable vs Non-Billable based on Hour Type or Group.
-    Learned from hour classification screenshot and standard logic.
-    """
-    hour_type = str(row.get('Hour Type', '')).upper()
-    group = str(row.get('Group', ''))
-    
-    # Group 100, 101, 104 or text containing Main d'oeuvre / Travel are billable
-    if 'MAIN D\'OEUVRE' in hour_type or 'TRAVEL' in hour_type or group in ['100', '101', '104']:
-        return 'Billable'
-    else:
-        return 'Non-Billable'
+# ERP 'Group' -> revenue treatment. Anything not listed defaults to Non-Billable.
+ERP_BILLABLE_GROUPS = {100, 101, 104, 200}   # external customer work
+ERP_INTERNAL_GROUPS = {300}                  # own-branch / internal WOs
+ERP_WARRANTY_GROUPS = {400, 500}             # warranty / goodwill
 
-# --- PAGE CONFIG ---
+# App activity codes -> category
+APP_BILLABLE_CODES = {"20", "30"}   # Main d'oeuvre, Temps de trajet
+APP_BREAK_CODES = {"100"}           # Pause
+APP_LEAVE_CODES = {"108", "102"}    # Conge paye, RCC - excluded from expected hrs
+
+STANDARD_DAY_HOURS = 7.0
+
+# Column fingerprints used to recognise a file
+APP_REQUIRED = ["Date", "Technicien", "Activite - Debut", "Activite - Fin", "Code"]
+ERP_REQUIRED = ["Shre Salarie", "Date", "WO No.", "Hour Type", "Status", "Group"]
+
+
+# ----------------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------------
+
+def deaccent(text: str) -> str:
+    """Lowercase, strip accents and punctuation - used for fuzzy column and name matching."""
+    text = str(text).replace("œ", "oe").replace("Œ", "OE")
+    text = text.replace("æ", "ae").replace("Æ", "AE")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def name_key(name) -> str:
+    """Order-independent person key: 'BOISSEAU Nicolas' == 'NICOLAS BOISSEAU'."""
+    return " ".join(sorted(deaccent(name).split()))
+
+
+def find_col(df, target):
+    """Return the real column name matching `target` ignoring accents/case/spacing."""
+    want = deaccent(target)
+    for col in df.columns:
+        if deaccent(col) == want:
+            return col
+    for col in df.columns:                     # partial fallback
+        if want in deaccent(col):
+            return col
+    return None
+
+
+def read_any(uploaded):
+    if uploaded.name.lower().endswith(".csv"):
+        return pd.read_csv(uploaded)
+    return pd.read_excel(uploaded, sheet_name=0)
+
+
+def detect_kind(df):
+    """Return ('app'|'erp'|None, missing_columns)."""
+    app_missing = [c for c in APP_REQUIRED if find_col(df, c) is None]
+    erp_missing = [c for c in ERP_REQUIRED if find_col(df, c) is None]
+    if len(app_missing) <= len(erp_missing) and len(app_missing) <= 1:
+        return "app", app_missing
+    if len(erp_missing) <= 1:
+        return "erp", erp_missing
+    # neither is a clean match - report whichever is closest
+    if len(app_missing) < len(erp_missing):
+        return None, app_missing
+    return None, erp_missing
+
+
+def strip_footer(df, key_col):
+    """Drop Irium summary rows: keep only rows whose key column is a clean integer id."""
+    keys = df[key_col].astype(str).str.strip()
+    return df[keys.str.fullmatch(r"\d+")].copy()
+
+
+def add_period_cols(df, date_col):
+    parsed = pd.to_datetime(df[date_col], errors="coerce", dayfirst=False)
+    df["Date_Parsed"] = parsed
+    df["Year"] = parsed.dt.year.astype("Int64").astype(str).replace("<NA>", "Unknown")
+    df["Month"] = parsed.dt.month.astype("Int64").astype(str).replace("<NA>", "Unknown")
+    df["Week"] = parsed.dt.isocalendar().week.astype("Int64").astype(str).replace("<NA>", "Unknown")
+    return df
+
+
+def expected_hours(dmin, dmax, year, month, week):
+    """Working-day baseline for the selected period."""
+    if pd.isna(dmin) or pd.isna(dmax):
+        return 0.0
+    start = dmin - pd.to_timedelta(dmin.dayofweek, unit="d")
+    end = dmax + pd.to_timedelta(6 - dmax.dayofweek, unit="d")
+    cal = pd.DataFrame({"Date": pd.date_range(start, end)})
+    cal["Year"] = cal["Date"].dt.year.astype(str)
+    cal["Month"] = cal["Date"].dt.month.astype(str)
+    cal["Week"] = cal["Date"].dt.isocalendar().week.astype("Int64").astype(str)
+    if year != "Total":
+        cal = cal[cal["Year"] == year]
+    if month != "Total":
+        cal = cal[cal["Month"] == month]
+    if week != "Total":
+        cal = cal[cal["Week"] == week]
+    return float((cal["Date"].dt.dayofweek < 5).sum() * STANDARD_DAY_HOURS)
+
+
+def classify_erp(group_value, hour_type):
+    try:
+        grp = int(float(group_value))
+    except (TypeError, ValueError):
+        grp = None
+    if grp in ERP_BILLABLE_GROUPS:
+        return "Billable"
+    if grp in ERP_INTERNAL_GROUPS:
+        return "Internal"
+    if grp in ERP_WARRANTY_GROUPS:
+        return "Warranty"
+    if grp is None and "main d oeuvre" in deaccent(hour_type):
+        return "Billable"          # last-resort fallback when Group is blank
+    return "Non-Billable"
+
+
+def classify_app(code):
+    code = str(code).strip()
+    if code.endswith(".0"):
+        code = code[:-2]
+    if code in APP_BREAK_CODES:
+        return "Break"
+    if code in APP_LEAVE_CODES:
+        return "Leave"
+    if code in APP_BILLABLE_CODES:
+        return "Billable"
+    return "Non-Billable"
+
+
+# ----------------------------------------------------------------------------
+# PAGE
+# ----------------------------------------------------------------------------
+
 st.set_page_config(page_title="Technician Productivity Dashboard", layout="wide")
+st.title("360 Technician Productivity Dashboard")
+st.caption("Self-reported app timesheet vs official ERP (Irium) labour booking.")
 
-st.title("📊 360° Technician Productivity Dashboard")
-st.markdown("Compare Self-Reported App Data against Official ERP (IRIUM) Data.")
-
-# --- SIDEBAR: FILE UPLOADS ---
-st.sidebar.header("📁 Data Sources")
-app_file = st.sidebar.file_uploader("1. Upload App Timesheet", type=["xlsx", "csv"], key="app")
-erp_file = st.sidebar.file_uploader("2. Upload ERP Report", type=["xlsx", "csv"], key="erp")
-
-# Initialize DataFrames
-app_df = None
-erp_df = None
-available_years, available_months, available_weeks = set(), set(), set()
-available_techs = set()
-
-# --- LOAD DATA & EXTRACT DATES FOR UNIFIED FILTERS ---
-with st.spinner("Loading data..."):
-    # 1. Load App Data
-    if app_file is not None:
-        try:
-            app_df = pd.read_csv(app_file) if app_file.name.endswith('.csv') else pd.read_excel(app_file, sheet_name=0)
-            app_df['Date_Parsed'] = pd.to_datetime(app_df['Date'], errors='coerce')
-            app_df['Year'] = app_df['Date_Parsed'].dt.year.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
-            app_df['Month'] = app_df['Date_Parsed'].dt.month.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
-            # Fix uint32 out of bounds error by safely casting to Int64 first
-            app_df['Week'] = app_df['Date_Parsed'].dt.isocalendar().week.astype('Int64').fillna(-1).astype(str).replace('-1', 'Unknown')
-            
-            available_years.update(app_df['Year'].unique())
-            available_months.update(app_df['Month'].unique())
-            available_weeks.update(app_df['Week'].unique())
-            available_techs.update(app_df['Technicien'].dropna().unique())
-        except Exception as e:
-            st.sidebar.error(f"Error loading App data: {e}")
-
-    # 2. Load ERP Data
-    if erp_file is not None:
-        try:
-            erp_df = pd.read_csv(erp_file) if erp_file.name.endswith('.csv') else pd.read_excel(erp_file, sheet_name=0)
-            erp_df['Date_Parsed'] = pd.to_datetime(erp_df['Date'], errors='coerce')
-            erp_df['Year'] = erp_df['Date_Parsed'].dt.year.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
-            erp_df['Month'] = erp_df['Date_Parsed'].dt.month.fillna(-1).astype(int).astype(str).replace('-1', 'Unknown')
-            # Fix uint32 out of bounds error by safely casting to Int64 first
-            erp_df['Week'] = erp_df['Date_Parsed'].dt.isocalendar().week.astype('Int64').fillna(-1).astype(str).replace('-1', 'Unknown')
-            
-            # Map ERP tech names immediately so we can use them in the global filter
-            erp_df['Tech_Name'] = erp_df['Shre Salarie'].map(TECH_MAPPING).fillna(erp_df['Shre Salarie'].astype(str) + " (Unknown Name)")
-
-            available_years.update(erp_df['Year'].unique())
-            available_months.update(erp_df['Month'].unique())
-            available_weeks.update(erp_df['Week'].unique())
-            available_techs.update(erp_df['Tech_Name'].dropna().unique())
-        except Exception as e:
-            st.sidebar.error(f"Error loading ERP data: {e}")
-
-# --- SIDEBAR: UNIFIED DATE FILTERS ---
-st.sidebar.markdown("---")
-st.sidebar.header("📅 Global Date Filters")
-st.sidebar.markdown("These filters apply to BOTH dashboards.")
-
-year_options = ['Total'] + sorted([y for y in available_years if y != 'Unknown'])
-selected_year = st.sidebar.selectbox("Year", year_options)
-
-month_options = ['Total'] + sorted([m for m in available_months if m != 'Unknown'], key=lambda x: int(x))
-selected_month = st.sidebar.selectbox("Month", month_options)
-
-week_options = ['Total'] + sorted([w for w in available_weeks if w != 'Unknown'], key=lambda x: int(x))
-selected_week = st.sidebar.selectbox("Week", week_options)
-
-st.sidebar.markdown("---")
-st.sidebar.header("🧑‍🔧 Technician Filters")
-excluded_techs = st.sidebar.multiselect(
-    "Exclude Technicians", 
-    options=sorted(list(available_techs)),
-    help="Select technicians to exclude from calculations (e.g., borrowed from other branches)."
+st.sidebar.header("Data")
+uploads = st.sidebar.file_uploader(
+    "Drop both files here (any order)",
+    type=["xlsx", "xls", "csv"],
+    accept_multiple_files=True,
+    help="Expected: 'Rapport journalier des heures*.xlsx' (app) and the Irium "
+         "technician-hours export (ERP). The app identifies each file by its columns.",
 )
 
-# --- MAIN DASHBOARD AREA ---
+app_df = erp_df = None
+reports = []
+
+for up in uploads or []:
+    try:
+        raw = read_any(up)
+    except Exception as exc:
+        reports.append(("error", up.name, f"Could not open the file: {exc}"))
+        continue
+
+    kind, missing = detect_kind(raw)
+
+    if kind is None:
+        reports.append((
+            "error", up.name,
+            "Not recognised as an App timesheet or an ERP export. "
+            f"Closest match is missing: {', '.join(missing)}",
+        ))
+        continue
+
+    if kind == "app":
+        if app_df is not None:
+            reports.append(("warn", up.name, "A second App timesheet was ignored - upload one at a time."))
+            continue
+        df = raw.copy()
+        df = df.rename(columns={find_col(df, "Technicien"): "Technicien"})
+        df = df[df["Technicien"].notna()].copy()
+        df = add_period_cols(df, find_col(df, "Date"))
+        bad_dates = int(df["Date_Parsed"].isna().sum())
+        df = df[df["Date_Parsed"].notna()].copy()
+        df["Name_Key"] = df["Technicien"].map(name_key)
+        app_df = df
+        note = f"App timesheet - {len(df)} activity rows, {df['Technicien'].nunique()} technicians, " \
+               f"{df['Date_Parsed'].min():%d/%m/%Y} to {df['Date_Parsed'].max():%d/%m/%Y}."
+        if bad_dates:
+            note += f" {bad_dates} row(s) dropped for unreadable dates."
+        reports.append(("ok", up.name, note))
+
+    else:  # erp
+        if erp_df is not None:
+            reports.append(("warn", up.name, "A second ERP export was ignored - upload one at a time."))
+            continue
+        df = raw.copy()
+        sal_col = find_col(df, "Shre Salarie")
+        before = len(df)
+        df = strip_footer(df, sal_col)
+        dropped = before - len(df)
+        df["Salarie_Id"] = df[sal_col].astype(float).astype(int)
+        df = add_period_cols(df, find_col(df, "Date"))
+        df = df[df["Date_Parsed"].notna()].copy()
+        df["Tech_Name"] = df["Salarie_Id"].map(TECH_MAPPING)
+        unmapped = sorted(df.loc[df["Tech_Name"].isna(), "Salarie_Id"].unique().tolist())
+        df["Tech_Name"] = df["Tech_Name"].fillna("ID " + df["Salarie_Id"].astype(str) + " (unmapped)")
+        df["Name_Key"] = df["Tech_Name"].map(name_key)
+        erp_df = df
+        note = f"ERP export - {len(df)} labour lines, {df['Tech_Name'].nunique()} technicians, " \
+               f"{df['Date_Parsed'].min():%d/%m/%Y} to {df['Date_Parsed'].max():%d/%m/%Y}."
+        if dropped:
+            note += f" {dropped} summary/footer row(s) removed."
+        reports.append(("ok", up.name, note))
+        if unmapped:
+            reports.append((
+                "warn", up.name,
+                f"Employee ID(s) {unmapped} are not in TECH_MAPPING - they show as 'unmapped'. "
+                "Add them at the top of Techapp.py.",
+            ))
+
+# --- validation panel -------------------------------------------------------
+if reports:
+    st.sidebar.markdown("### File check")
+    for level, fname, msg in reports:
+        icon = {"ok": "OK", "warn": "CHECK", "error": "FAIL"}[level]
+        body = f"**{icon} - {fname}**\n\n{msg}"
+        (st.sidebar.success if level == "ok" else
+         st.sidebar.warning if level == "warn" else st.sidebar.error)(body)
+
+if app_df is None:
+    st.sidebar.info("No App timesheet loaded yet.")
+if erp_df is None:
+    st.sidebar.info("No ERP export loaded yet.")
+
+# --- global filters ---------------------------------------------------------
+years, months, weeks, techs = set(), set(), set(), set()
+for d, tcol in ((app_df, "Technicien"), (erp_df, "Tech_Name")):
+    if d is not None:
+        years |= set(d["Year"].unique())
+        months |= set(d["Month"].unique())
+        weeks |= set(d["Week"].unique())
+        techs |= set(d[tcol].dropna().unique())
+
+st.sidebar.markdown("---")
+st.sidebar.header("Period")
+sel_year = st.sidebar.selectbox("Year", ["Total"] + sorted(y for y in years if y != "Unknown"))
+sel_month = st.sidebar.selectbox("Month", ["Total"] + sorted((m for m in months if m != "Unknown"), key=int))
+sel_week = st.sidebar.selectbox("Week", ["Total"] + sorted((w for w in weeks if w != "Unknown"), key=int))
+
+st.sidebar.header("Technicians")
+excluded = st.sidebar.multiselect(
+    "Exclude", options=sorted(techs),
+    help="Excluding a name here also excludes the matching name in the other file.",
+)
+excluded_keys = {name_key(t) for t in excluded}
+
+
+def apply_filters(df):
+    out = df.copy()
+    if sel_year != "Total":
+        out = out[out["Year"] == sel_year]
+    if sel_month != "Total":
+        out = out[out["Month"] == sel_month]
+    if sel_week != "Total":
+        out = out[out["Week"] == sel_week]
+    if excluded_keys:
+        out = out[~out["Name_Key"].isin(excluded_keys)]
+    return out
+
+
+COLORS = {"Billable Hours": "#2ca02c", "Non-Billable Hours": "#d62728",
+          "Unreported Hours": "#7f7f7f", "Internal Hours": "#ff7f0e",
+          "Warranty Hours": "#9467bd"}
+
 if app_df is None and erp_df is None:
-    st.info("👈 Please upload at least one file from the sidebar to view the dashboard.")
-else:
-    # Create Tabs
-    tab1, tab2 = st.tabs(["📱 Self-Reported Timesheet (App)", "🏢 Official ERP Data (IRIUM)"])
+    st.info("Upload your files in the sidebar. Both can be dropped at once - the app sorts them out.")
+    st.stop()
 
-    # ==========================================
-    # TAB 1: SELF-REPORTED APP DATA
-    # ==========================================
-    with tab1:
-        if app_df is None:
-            st.warning("No App Timesheet uploaded.")
-        else:
-            # Process App Data
-            or_col = [col for col in app_df.columns if 'Numéro OR' in col and 'Main' in col]
-            or_col_name = or_col[0] if or_col else None
-            
-            app_df['Start_Time'] = pd.to_datetime(app_df['Date'].astype(str) + ' ' + app_df['Activité — Début'].astype(str), errors='coerce')
-            app_df['End_Time'] = pd.to_datetime(app_df['Date'].astype(str) + ' ' + app_df['Activité — Fin'].astype(str), errors='coerce')
-            app_df['Duration_Hours'] = (app_df['End_Time'] - app_df['Start_Time']).dt.total_seconds() / 3600.0
-            app_df.loc[app_df['Duration_Hours'] < 0, 'Duration_Hours'] += 24
-            app_df['Duration_Hours'] = app_df['Duration_Hours'].fillna(0)
+tab_app, tab_erp, tab_cmp = st.tabs(["Self-reported (App)", "Official ERP (Irium)", "App vs ERP"])
 
-            def categorize_app(row):
-                code = str(row.get('Code', '')).strip()
-                if code == '100': return 'Break'
-                elif code in ['20', '30']: return 'Billable'
-                else: return 'Non-Billable'
+# ============================================================================
+# TAB 1 - APP
+# ============================================================================
+app_summary = pd.DataFrame()
+with tab_app:
+    if app_df is None:
+        st.warning("No App timesheet loaded.")
+    else:
+        d = app_df.copy()
+        c_start, c_end = find_col(d, "Activite - Debut"), find_col(d, "Activite - Fin")
+        c_code = find_col(d, "Code")
+        c_or = find_col(d, "Numero OR - Main d oeuvre")
 
-            app_df['Category'] = app_df.apply(categorize_app, axis=1)
+        base = d["Date_Parsed"].dt.strftime("%Y-%m-%d")
+        start = pd.to_datetime(base + " " + d[c_start].astype(str), errors="coerce")
+        end = pd.to_datetime(base + " " + d[c_end].astype(str), errors="coerce")
+        dur = (end - start).dt.total_seconds() / 3600.0
+        dur = dur.where(dur >= 0, dur + 24).fillna(0)
+        d["Duration_Hours"] = dur
+        d["Category"] = d[c_code].map(classify_app)
+        d["Work_Order"] = (d[c_or].astype(str).replace(["nan", "", "None", "NaT"], "No Work Order")
+                           if c_or else "No Work Order")
 
-            if or_col_name:
-                app_df['Work_Order'] = app_df[or_col_name].fillna('No Work Order').astype(str)
-                app_df['Work_Order'] = app_df['Work_Order'].replace(['nan', '', 'None'], 'No Work Order')
-            else:
-                app_df['Work_Order'] = 'No Work Order'
+        f = apply_filters(d)
+        work = f[~f["Category"].isin(["Break", "Leave"])]
 
-            # Apply Filters
-            filtered_app = app_df.copy()
-            if selected_year != 'Total': filtered_app = filtered_app[filtered_app['Year'] == selected_year]
-            if selected_month != 'Total': filtered_app = filtered_app[filtered_app['Month'] == selected_month]
-            if selected_week != 'Total': filtered_app = filtered_app[filtered_app['Week'] == selected_week]
-            if excluded_techs: filtered_app = filtered_app[~filtered_app['Technicien'].isin(excluded_techs)]
+        baseline = expected_hours(d["Date_Parsed"].min(), d["Date_Parsed"].max(),
+                                  sel_year, sel_month, sel_week)
 
-            work_app_df = filtered_app[filtered_app['Category'] != 'Break'].copy()
+        roster = [t for t in d["Technicien"].dropna().unique() if name_key(t) not in excluded_keys]
+        agg = (work.groupby("Technicien")
+               .apply(lambda x: pd.Series({
+                   "Total Logged Hours": x["Duration_Hours"].sum(),
+                   "Billable Hours": x.loc[x["Category"] == "Billable", "Duration_Hours"].sum(),
+                   "Non-Billable Hours": x.loc[x["Category"] == "Non-Billable", "Duration_Hours"].sum(),
+               }), include_groups=False)
+               .reset_index() if len(work) else
+               pd.DataFrame(columns=["Technicien", "Total Logged Hours", "Billable Hours", "Non-Billable Hours"]))
 
-            # Calendar Expected Hours Baseline
-            if not app_df['Date_Parsed'].dropna().empty:
-                global_min = app_df['Date_Parsed'].min()
-                global_max = app_df['Date_Parsed'].max()
-                start_date = global_min - pd.to_timedelta(global_min.dayofweek, unit='d')
-                end_date = global_max + pd.to_timedelta(6 - global_max.dayofweek, unit='d')
-                
-                cal_df = pd.DataFrame({'Date': pd.date_range(start=start_date, end=end_date)})
-                cal_df['Year'] = cal_df['Date'].dt.year.astype(str)
-                cal_df['Month'] = cal_df['Date'].dt.month.astype(str)
-                cal_df['Week'] = cal_df['Date'].dt.isocalendar().week.astype('Int64').astype(str)
-                cal_df['Is_Weekday'] = cal_df['Date'].dt.dayofweek < 5
-                
-                if selected_year != 'Total': cal_df = cal_df[cal_df['Year'] == selected_year]
-                if selected_month != 'Total': cal_df = cal_df[cal_df['Month'] == selected_month]
-                if selected_week != 'Total': cal_df = cal_df[cal_df['Week'] == selected_week]
-                
-                expected_hours_baseline = float(cal_df['Is_Weekday'].sum() * 7.0)
-            else:
-                expected_hours_baseline = 0.0
+        app_summary = pd.merge(pd.DataFrame({"Technicien": roster}), agg, on="Technicien", how="left").fillna(0)
+        app_summary["Expected Hours"] = baseline
+        app_summary["Unreported Hours"] = np.maximum(0, baseline - app_summary["Total Logged Hours"])
+        app_summary["Effective Total Hours"] = app_summary["Total Logged Hours"] + app_summary["Unreported Hours"]
+        app_summary["Productivity (%)"] = np.where(
+            app_summary["Effective Total Hours"] > 0,
+            app_summary["Billable Hours"] / app_summary["Effective Total Hours"] * 100, 0)
+        app_summary["Name_Key"] = app_summary["Technicien"].map(name_key)
+        app_summary = app_summary.sort_values("Productivity (%)", ascending=False)
 
-            # Exclude them from the master technician list so they do not show up as 0 hours
-            all_techs = [t for t in app_df['Technicien'].dropna().unique() if t not in excluded_techs]
-            app_summary = work_app_df.groupby('Technicien').apply(
-                lambda x: pd.Series({
-                    'Total Logged Hours': x['Duration_Hours'].sum(),
-                    'Billable Hours': x.loc[x['Category'] == 'Billable', 'Duration_Hours'].sum(),
-                    'Non-Billable Hours': x.loc[x['Category'] == 'Non-Billable', 'Duration_Hours'].sum()
-                })
-            ).reset_index()
-            
-            # --- FIX: Ensure columns exist even if the filtered data is completely empty ---
-            for col in ['Total Logged Hours', 'Billable Hours', 'Non-Billable Hours']:
-                if col not in app_summary.columns:
-                    app_summary[col] = 0.0
+        eff = app_summary["Effective Total Hours"].sum()
+        cols = st.columns(5)
+        cols[0].metric("Expected", f"{app_summary['Expected Hours'].sum():.1f} h")
+        cols[1].metric("Logged", f"{app_summary['Total Logged Hours'].sum():.1f} h")
+        cols[2].metric("Billable", f"{app_summary['Billable Hours'].sum():.1f} h")
+        cols[3].metric("Unreported", f"{app_summary['Unreported Hours'].sum():.1f} h")
+        cols[4].metric("Team productivity",
+                       f"{(app_summary['Billable Hours'].sum() / eff * 100) if eff else 0:.1f} %")
 
-            app_summary = pd.merge(pd.DataFrame({'Technicien': all_techs}), app_summary, on='Technicien', how='left').fillna(0)
-            
-            if not app_summary.empty:
-                app_summary['Expected Hours'] = expected_hours_baseline
-                app_summary['Unreported Hours'] = np.maximum(0, app_summary['Expected Hours'] - app_summary['Total Logged Hours'])
-                app_summary['Effective Total Hours'] = app_summary['Total Logged Hours'] + app_summary['Unreported Hours']
-                app_summary['Productivity (%)'] = np.where(app_summary['Effective Total Hours'] > 0, (app_summary['Billable Hours'] / app_summary['Effective Total Hours']) * 100, 0)
-                app_summary = app_summary.sort_values('Productivity (%)', ascending=False)
-            
-            # App UI
-            st.subheader("🏆 App Data - Overall Team Productivity (Expected vs Logged)")
-            total_exp = app_summary['Expected Hours'].sum()
-            total_log = app_summary['Total Logged Hours'].sum()
-            total_effective = app_summary['Effective Total Hours'].sum() if not app_summary.empty else 0
-            bill_hrs = app_summary['Billable Hours'].sum()
-            unrep_hrs = app_summary['Unreported Hours'].sum()
-            app_prod = (bill_hrs / total_effective * 100) if total_effective > 0 else 0
+        left, right = st.columns(2)
+        with left:
+            melted = app_summary.melt(id_vars="Technicien",
+                                      value_vars=["Billable Hours", "Non-Billable Hours", "Unreported Hours"],
+                                      var_name="Type", value_name="Hours")
+            fig = px.bar(melted, x="Technicien", y="Hours", color="Type",
+                         color_discrete_map=COLORS, barmode="stack", title="Hours split by technician")
+            st.plotly_chart(fig, use_container_width=True)
+        with right:
+            fig2 = px.bar(app_summary, x="Technicien", y="Productivity (%)",
+                          text=app_summary["Productivity (%)"].map("{:.1f}%".format),
+                          color="Productivity (%)", color_continuous_scale="Blues",
+                          title="Productivity %")
+            fig2.update_traces(textposition="outside")
+            st.plotly_chart(fig2, use_container_width=True)
 
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Expected Hours", f"{total_exp:.1f} h")
-            c2.metric("Logged Hours", f"{total_log:.1f} h")
-            c3.metric("Billable Hours", f"{bill_hrs:.1f} h")
-            c4.metric("Unreported Hours", f"{unrep_hrs:.1f} h")
-            c5.metric("Team Productivity", f"{app_prod:.1f} %")
+        with st.expander("Activity code breakdown"):
+            st.dataframe(
+                f.groupby([c_code, find_col(f, "Libelle activite") or c_code])["Duration_Hours"]
+                 .sum().round(2).reset_index(), use_container_width=True)
 
-            c_chart1, c_chart2 = st.columns(2)
-            with c_chart1:
-                melted = app_summary.melt(id_vars='Technicien', value_vars=['Billable Hours', 'Non-Billable Hours', 'Unreported Hours'], var_name='Type', value_name='Hours')
-                fig_hrs = px.bar(melted, x='Technicien', y='Hours', color='Type', color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728', 'Unreported Hours': '#7f7f7f'}, barmode='stack')
-                
-                # --- FIX: Safe max calculation for empty dataframes ---
-                max_logged = app_summary['Total Logged Hours'].max() if not app_summary.empty else 0
-                max_logged = 0 if pd.isna(max_logged) else max_logged
-                max_y = max(expected_hours_baseline * 1.1, max_logged * 1.1) if expected_hours_baseline > 0 else 40
-                
-                fig_hrs.update_layout(yaxis=dict(range=[0, max_y]), title="Hours Split by Technician")
-                st.plotly_chart(fig_hrs, use_container_width=True)
+# ============================================================================
+# TAB 2 - ERP
+# ============================================================================
+erp_summary = pd.DataFrame()
+with tab_erp:
+    if erp_df is None:
+        st.warning("No ERP export loaded.")
+    else:
+        d = erp_df.copy()
+        c_hours = find_col(d, "Time carried out") or find_col(d, "Duration")
+        c_status, c_group = find_col(d, "Status"), find_col(d, "Group")
+        c_hourtype, c_wo = find_col(d, "Hour Type"), find_col(d, "WO No.")
 
-            with c_chart2:
-                fig_prod = px.bar(app_summary, x='Technicien', y='Productivity (%)', text=app_summary['Productivity (%)'].apply(lambda x: f'{x:.1f}%'), color='Productivity (%)', color_continuous_scale='Blues')
-                fig_prod.update_traces(textposition='outside')
-                fig_prod.update_layout(yaxis=dict(range=[0, max(100, app_summary['Productivity (%)'].max() + 10)]), title="Productivity %")
-                st.plotly_chart(fig_prod, use_container_width=True)
+        d[c_hours] = pd.to_numeric(d[c_hours], errors="coerce").fillna(0)
+        d["Category"] = [classify_erp(g, h) for g, h in zip(d[c_group], d[c_hourtype])]
+        d["Status_Label"] = d[c_status].map(WO_STATUS_MAPPING).fillna(d[c_status].astype(str))
 
+        f = apply_filters(d)
+        baseline = expected_hours(d["Date_Parsed"].min(), d["Date_Parsed"].max(),
+                                  sel_year, sel_month, sel_week)
 
-    # ==========================================
-    # TAB 2: OFFICIAL ERP DATA (IRIUM)
-    # ==========================================
-    with tab2:
-        if erp_df is None:
-            st.warning("No ERP Report uploaded.")
-        else:
-            # Process ERP Data
-            filtered_erp = erp_df.copy()
-            if selected_year != 'Total': filtered_erp = filtered_erp[filtered_erp['Year'] == selected_year]
-            if selected_month != 'Total': filtered_erp = filtered_erp[filtered_erp['Month'] == selected_month]
-            if selected_week != 'Total': filtered_erp = filtered_erp[filtered_erp['Week'] == selected_week]
-            if excluded_techs: filtered_erp = filtered_erp[~filtered_erp['Tech_Name'].isin(excluded_techs)]
+        roster = [t for t in d["Tech_Name"].dropna().unique() if name_key(t) not in excluded_keys]
+        pivot = (f.pivot_table(index="Tech_Name", columns="Category", values=c_hours,
+                               aggfunc="sum").fillna(0).reset_index()
+                 if len(f) else pd.DataFrame({"Tech_Name": []}))
+        for cat in ["Billable", "Non-Billable", "Internal", "Warranty"]:
+            if cat not in pivot.columns:
+                pivot[cat] = 0.0
+        pivot = pivot.rename(columns={"Billable": "Billable Hours", "Non-Billable": "Non-Billable Hours",
+                                      "Internal": "Internal Hours", "Warranty": "Warranty Hours"})
 
-            # Apply Mappings
-            filtered_erp['Status_Label'] = filtered_erp['Status'].map(WO_STATUS_MAPPING).fillna(filtered_erp['Status'].astype(str))
-            filtered_erp['Category'] = filtered_erp.apply(classify_erp_hours, axis=1)
-            
-            # Using 'Time carried out' as actual worked hours
-            worked_col = 'Time carried out' if 'Time carried out' in filtered_erp.columns else 'Duration'
-            filtered_erp[worked_col] = pd.to_numeric(filtered_erp[worked_col], errors='coerce').fillna(0)
+        erp_summary = pd.merge(pd.DataFrame({"Tech_Name": roster}), pivot, on="Tech_Name", how="left").fillna(0)
+        erp_summary["Total Hours Worked"] = erp_summary[
+            ["Billable Hours", "Non-Billable Hours", "Internal Hours", "Warranty Hours"]].sum(axis=1)
+        erp_summary["Expected Hours"] = baseline
+        erp_summary["Unreported Hours"] = np.maximum(0, baseline - erp_summary["Total Hours Worked"])
+        erp_summary["Effective Total Hours"] = erp_summary["Total Hours Worked"] + erp_summary["Unreported Hours"]
+        erp_summary["Productivity (%)"] = np.where(
+            erp_summary["Effective Total Hours"] > 0,
+            erp_summary["Billable Hours"] / erp_summary["Effective Total Hours"] * 100, 0)
+        erp_summary["Name_Key"] = erp_summary["Tech_Name"].map(name_key)
+        erp_summary = erp_summary.sort_values("Productivity (%)", ascending=False)
 
-            # Calendar Expected Hours Baseline for ERP
-            if not erp_df['Date_Parsed'].dropna().empty:
-                erp_min = erp_df['Date_Parsed'].min()
-                erp_max = erp_df['Date_Parsed'].max()
-                erp_start = erp_min - pd.to_timedelta(erp_min.dayofweek, unit='d')
-                erp_end = erp_max + pd.to_timedelta(6 - erp_max.dayofweek, unit='d')
-                
-                cal_erp_df = pd.DataFrame({'Date': pd.date_range(start=erp_start, end=erp_end)})
-                cal_erp_df['Year'] = cal_erp_df['Date'].dt.year.astype(str)
-                cal_erp_df['Month'] = cal_erp_df['Date'].dt.month.astype(str)
-                cal_erp_df['Week'] = cal_erp_df['Date'].dt.isocalendar().week.astype('Int64').astype(str)
-                cal_erp_df['Is_Weekday'] = cal_erp_df['Date'].dt.dayofweek < 5
-                
-                if selected_year != 'Total': cal_erp_df = cal_erp_df[cal_erp_df['Year'] == selected_year]
-                if selected_month != 'Total': cal_erp_df = cal_erp_df[cal_erp_df['Month'] == selected_month]
-                if selected_week != 'Total': cal_erp_df = cal_erp_df[cal_erp_df['Week'] == selected_week]
-                
-                erp_expected_hours_baseline = float(cal_erp_df['Is_Weekday'].sum() * 7.0)
-            else:
-                erp_expected_hours_baseline = 0.0
+        st.caption("Productivity = Billable / (Hours booked + Unreported). Internal (Group 300) and "
+                   "warranty (400/500) hours are worked but not customer-billable.")
+        eff = erp_summary["Effective Total Hours"].sum()
+        cols = st.columns(6)
+        cols[0].metric("Expected", f"{erp_summary['Expected Hours'].sum():.1f} h")
+        cols[1].metric("Booked", f"{erp_summary['Total Hours Worked'].sum():.1f} h")
+        cols[2].metric("Billable", f"{erp_summary['Billable Hours'].sum():.1f} h")
+        cols[3].metric("Internal", f"{erp_summary['Internal Hours'].sum():.1f} h")
+        cols[4].metric("Warranty", f"{erp_summary['Warranty Hours'].sum():.1f} h")
+        cols[5].metric("Team productivity", f"{(erp_summary['Billable Hours'].sum() / eff * 100) if eff else 0:.1f} %")
 
-            # Master list of techs (Mapped techs + any unexpected techs found in the file), minus exclusions
-            known_techs = list(TECH_MAPPING.values())
-            found_techs = filtered_erp['Tech_Name'].dropna().unique().tolist()
-            combined_techs = [t for t in list(set(known_techs + found_techs)) if t not in excluded_techs]
-            all_erp_techs = pd.DataFrame({'Tech_Name': combined_techs})
+        left, right = st.columns(2)
+        with left:
+            melted = erp_summary.melt(
+                id_vars="Tech_Name",
+                value_vars=["Billable Hours", "Internal Hours", "Warranty Hours",
+                            "Non-Billable Hours", "Unreported Hours"],
+                var_name="Type", value_name="Hours")
+            fig = px.bar(melted, x="Tech_Name", y="Hours", color="Type",
+                         color_discrete_map=COLORS, barmode="stack", title="Booked ERP hours split")
+            st.plotly_chart(fig, use_container_width=True)
+        with right:
+            fig2 = px.bar(erp_summary, x="Tech_Name", y="Productivity (%)",
+                          text=erp_summary["Productivity (%)"].map("{:.1f}%".format),
+                          color="Productivity (%)", color_continuous_scale="Greens",
+                          title="Official ERP productivity %")
+            fig2.update_traces(textposition="outside")
+            st.plotly_chart(fig2, use_container_width=True)
 
-            erp_summary_raw = filtered_erp.groupby('Tech_Name').apply(
-                lambda x: pd.Series({
-                    'Total Hours Worked': x[worked_col].sum(),
-                    'Billable Hours': x.loc[x['Category'] == 'Billable', worked_col].sum(),
-                    'Non-Billable Hours': x.loc[x['Category'] == 'Non-Billable', worked_col].sum()
-                })
-            ).reset_index()
+        st.markdown("---")
+        st.subheader("Work order detail")
+        drill = st.multiselect("Drill down into technician(s)",
+                               options=sorted(f["Tech_Name"].dropna().unique()))
+        sub = f[f["Tech_Name"].isin(drill)] if drill else f
+        wo = (sub.pivot_table(index=[c_wo, "Status_Label"], columns="Category",
+                              values=c_hours, aggfunc="sum").fillna(0).reset_index()
+              if len(sub) else pd.DataFrame(columns=[c_wo, "Status_Label"]))
+        for cat in ["Billable", "Non-Billable", "Internal", "Warranty"]:
+            if cat not in wo.columns:
+                wo[cat] = 0.0
+        wo["Total Hours"] = wo[["Billable", "Non-Billable", "Internal", "Warranty"]].sum(axis=1)
+        st.dataframe(wo.sort_values("Total Hours", ascending=False).round(2), use_container_width=True)
 
-            # --- FIX: Ensure columns exist even if the filtered data is completely empty ---
-            for col in ['Total Hours Worked', 'Billable Hours', 'Non-Billable Hours']:
-                if col not in erp_summary_raw.columns:
-                    erp_summary_raw[col] = 0.0
+# ============================================================================
+# TAB 3 - COMPARISON
+# ============================================================================
+with tab_cmp:
+    if app_df is None or erp_df is None:
+        st.warning("Upload both files to compare declared hours against booked hours.")
+    else:
+        a = app_summary[["Name_Key", "Technicien", "Total Logged Hours", "Billable Hours"]].rename(
+            columns={"Total Logged Hours": "App Logged", "Billable Hours": "App Billable"})
+        e = erp_summary[["Name_Key", "Tech_Name", "Total Hours Worked", "Billable Hours"]].rename(
+            columns={"Total Hours Worked": "ERP Booked", "Billable Hours": "ERP Billable"})
+        m = pd.merge(a, e, on="Name_Key", how="outer").fillna(0)
+        m["Technician"] = np.where(m["Technicien"] != 0, m["Technicien"], m["Tech_Name"])
+        m["Gap (App - ERP)"] = m["App Billable"] - m["ERP Billable"]
+        m = m[["Technician", "App Logged", "App Billable", "ERP Booked", "ERP Billable", "Gap (App - ERP)"]]
+        m = m.sort_values("Gap (App - ERP)", key=abs, ascending=False)
 
-            # Merge to ensure techs who logged 0 hours appear
-            erp_summary = pd.merge(all_erp_techs, erp_summary_raw, on='Tech_Name', how='left').fillna(0)
+        st.subheader("Declared vs booked")
+        st.caption("A large positive gap means the technician logged billable time in the app that never "
+                   "reached a work order in Irium - revenue leakage. A negative gap means the app timesheet "
+                   "is incomplete.")
+        st.dataframe(m.round(2), use_container_width=True)
 
-            # Assign Expected and Unreported Hours
-            erp_summary['Expected Hours'] = erp_expected_hours_baseline
-            erp_summary['Unreported Hours'] = np.maximum(0, erp_summary['Expected Hours'] - erp_summary['Total Hours Worked'])
-            erp_summary['Effective Total Hours'] = erp_summary['Total Hours Worked'] + erp_summary['Unreported Hours']
-
-            # --- CUSTOM PRODUCTIVITY CALCULATION (Adapted from PDF) ---
-            # Formula adapted: Billable Hours / (Total Hours Worked + Unreported Hours)
-            erp_summary['Productivity (%)'] = np.where(
-                erp_summary['Effective Total Hours'] > 0,
-                (erp_summary['Billable Hours'] / erp_summary['Effective Total Hours']) * 100,
-                0
-            )
-            erp_summary = erp_summary.sort_values('Productivity (%)', ascending=False)
-
-            st.subheader("🏆 ERP Data - Adjusted Productivity (Includes Unreported)")
-            st.caption("ℹ️ *Note: To address under-reporting, the official PDF formula has been adapted. Unreported hours are effectively treated as non-billable time. Productivity = Billable Hours / (Logged Hours + Unreported Hours). Overtime increases the total hours for the day.*")
-            
-            erp_total_worked = erp_summary['Total Hours Worked'].sum()
-            erp_total_expected = erp_summary['Expected Hours'].sum()
-            erp_total_effective = erp_summary['Effective Total Hours'].sum()
-            erp_billable = erp_summary['Billable Hours'].sum()
-            erp_non_billable = erp_summary['Non-Billable Hours'].sum()
-            erp_unreported = erp_summary['Unreported Hours'].sum()
-            erp_team_prod = (erp_billable / erp_total_effective * 100) if erp_total_effective > 0 else 0
-
-            ec1, ec2, ec3, ec4, ec5, ec6 = st.columns(6)
-            ec1.metric("Expected Hours", f"{erp_total_expected:.1f} h")
-            ec2.metric("Hours Worked (ERP)", f"{erp_total_worked:.1f} h")
-            ec3.metric("Billable (ERP)", f"{erp_billable:.1f} h")
-            ec4.metric("Non-Billable (ERP)", f"{erp_non_billable:.1f} h")
-            ec5.metric("Unreported", f"{erp_unreported:.1f} h")
-            ec6.metric("ERP Team Prod", f"{erp_team_prod:.1f} %")
-
-            ec_chart1, ec_chart2 = st.columns(2)
-            
-            # Variable to capture clicked technicians from the chart
-            selected_techs_from_chart = []
-            
-            with ec_chart1:
-                erp_melted = erp_summary.melt(id_vars='Tech_Name', value_vars=['Billable Hours', 'Non-Billable Hours', 'Unreported Hours'], var_name='Type', value_name='Hours')
-                fig_erp_hrs = px.bar(erp_melted, x='Tech_Name', y='Hours', color='Type', color_discrete_map={'Billable Hours': '#2ca02c', 'Non-Billable Hours': '#d62728', 'Unreported Hours': '#7f7f7f'}, barmode='stack')
-                
-                # --- FIX: Safe max calculation for empty dataframes ---
-                max_worked = erp_summary['Total Hours Worked'].max() if not erp_summary.empty else 0
-                max_worked = 0 if pd.isna(max_worked) else max_worked
-                max_y_erp = max(erp_expected_hours_baseline * 1.1, max_worked * 1.1) if erp_expected_hours_baseline > 0 else 40
-                
-                fig_erp_hrs.update_layout(yaxis=dict(range=[0, max_y_erp]), title="Logged ERP Hours Split")
-                
-                # INTERACTIVE SELECTION (Tries to use modern Streamlit 1.35+ feature)
-                try:
-                    chart_event = st.plotly_chart(fig_erp_hrs, use_container_width=True, on_select="rerun")
-                    if chart_event and "selection" in chart_event and "points" in chart_event["selection"]:
-                        selected_techs_from_chart = list(set([p["x"] for p in chart_event["selection"]["points"]]))
-                except TypeError:
-                    # Fallback for older Streamlit versions
-                    st.plotly_chart(fig_erp_hrs, use_container_width=True)
-
-            with ec_chart2:
-                fig_erp_prod = px.bar(erp_summary, x='Tech_Name', y='Productivity (%)', text=erp_summary['Productivity (%)'].apply(lambda x: f'{x:.1f}%'), color='Productivity (%)', color_continuous_scale='Greens')
-                fig_erp_prod.update_traces(textposition='outside')
-                fig_erp_prod.update_layout(yaxis=dict(range=[0, max(100, erp_summary['Productivity (%)'].max() + 10)]), title="Official ERP Productivity %")
-                st.plotly_chart(fig_erp_prod, use_container_width=True)
-
-            # Detailed ERP Data Table
-            st.markdown("---")
-            st.subheader("📋 ERP Work Order Details")
-            
-            # Initialize dropdown with technicians clicked on the chart (if any)
-            available_drill_techs = sorted(filtered_erp['Tech_Name'].dropna().unique())
-            default_selection = [t for t in selected_techs_from_chart if t in available_drill_techs]
-            
-            drill_down_techs = st.multiselect(
-                "🔎 Select Technician(s) to drill down into their Work Orders (or click the bars on the chart above!):",
-                options=available_drill_techs,
-                default=default_selection
-            )
-            
-            # Apply Drill Down Filter
-            if drill_down_techs:
-                wo_drill_df = filtered_erp[filtered_erp['Tech_Name'].isin(drill_down_techs)]
-                st.caption(f"Showing Work Orders for: **{', '.join(drill_down_techs)}**")
-            else:
-                wo_drill_df = filtered_erp
-                st.caption("Showing Work Orders for **ALL** technicians. Select a technician above to drill down.")
-
-            wo_erp_summary = wo_drill_df.groupby(['WO No.', 'Status_Label', 'Category'])[worked_col].sum().reset_index()
-            
-            # --- FIX: Use pivot_table instead of pivot to prevent duplicate/unhashable list errors ---
-            if not wo_erp_summary.empty:
-                wo_erp_pivot = wo_erp_summary.pivot_table(index=['WO No.', 'Status_Label'], columns='Category', values=worked_col, aggfunc='sum').fillna(0).reset_index()
-            else:
-                wo_erp_pivot = pd.DataFrame(columns=['WO No.', 'Status_Label', 'Billable', 'Non-Billable'])
-            
-            for col in ['Billable', 'Non-Billable']:
-                if col not in wo_erp_pivot.columns: wo_erp_pivot[col] = 0
-                
-            wo_erp_pivot['Total Hours'] = wo_erp_pivot['Billable'] + wo_erp_pivot['Non-Billable']
-            wo_erp_pivot = wo_erp_pivot.sort_values(by='Total Hours', ascending=False)
-            
-            st.dataframe(wo_erp_pivot.style.format({'Billable': '{:.2f}', 'Non-Billable': '{:.2f}', 'Total Hours': '{:.2f}'}), use_container_width=True)
+        melted = m.melt(id_vars="Technician", value_vars=["App Billable", "ERP Billable"],
+                        var_name="Source", value_name="Hours")
+        st.plotly_chart(px.bar(melted, x="Technician", y="Hours", color="Source",
+                               barmode="group", title="Billable hours: app vs ERP"),
+                        use_container_width=True)
