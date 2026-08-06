@@ -33,6 +33,7 @@ Three tabs:
 | **Self-reported (App)** | technician timesheet | How does the technician account for their day? |
 | **Official ERP (Irium)** | labour lines on work orders | What did we actually book, and how much of it is billable? |
 | **App vs ERP** | both | Where is billable time being logged but never invoiced? |
+| **Recovery funnel** | both + attendance | Of every hour paid for, how much survives to a booked work order? |
 
 Global filters (year / month / week / excluded technicians) apply to all three tabs
 at once, so every figure on screen always refers to the same period.
@@ -100,14 +101,23 @@ Export the responses sheet as `.xlsx`. **Sheet 1** (`Feuille 1`) is used; the
 |---|---|---|---|
 | 1 | `Date` | period filters | a real date, not text |
 | 2 | `Technicien` | grouping | `SURNAME Firstname` |
+| 3 | `Heure arrivée` | attendance denominator | `HH:MM:SS` |
+| 4 | `Heure départ` | attendance denominator | `HH:MM:SS` |
+| 5 | `Retard (min)` | lateness | minutes |
+| 6 | `Heures travaillées` | **hours paid for** | `7h15` format |
+| 7 | `Dépassement horaire` | overtime flag | `Oui` / `Non` |
 | 9 | `Activité — Début` | duration | `HH:MM:SS` |
 | 10 | `Activité — Fin` | duration | `HH:MM:SS` |
 | 11 | `Code` | billable classification | number, or `AUT` |
 | 14 | `Numéro OR — Main d'œuvre (20)` | work-order linkage | 8-digit WO number |
 
-All other columns (`Heure arrivée`, `Retard (min)`, `Commune`, `Commentaires`,
-`Horodatage`, …) are carried through untouched, and extra columns are harmless.
-**Do not rename or reorder the six above** — that is the only thing that breaks it.
+All other columns (`Commune`, `Commentaires`, `Horodatage`, …) are carried through
+untouched, and extra columns are harmless. **Do not rename or reorder those above** —
+that is the only thing that breaks it.
+
+`Heures travaillées` is the technician's own declared worked time: clock span minus
+breaks. It is the closest thing in the data to *hours the company paid for*, which is
+why it is the default denominator.
 
 Header matching ignores accents, case and spacing, so `Activite - Debut` also works.
 
@@ -211,14 +221,51 @@ Also kept and available: `Branch`, `Customer name`, `Labor type`, `Sort`, `Type`
 ## How the numbers are calculated
 
 ```
-Expected hours    = working days in the selected period × 7 h
-Unreported hours  = max(0, Expected − Logged)
-Effective hours   = Logged + Unreported
+Hours paid        = per the selected denominator (see below)
+Unaccounted hours = max(0, Hours paid − Logged)
+Effective hours   = Logged + Unaccounted        ( = max(Logged, Hours paid) )
 Productivity %    = Billable ÷ Effective hours
 ```
 
-Unreported time is deliberately treated as non-billable. Not filling in the
-timesheet therefore lowers the score rather than hiding it.
+### Choosing a denominator
+
+Set this in the sidebar. It is the single biggest lever on the reported number.
+
+| Option | Denominator | Use when |
+|---|---|---|
+| **Attendance — declared** (default) | `Heures travaillées` summed over the days attended | You want productivity against hours actually paid for. Absent days are excluded, so it does not punish approved leave. |
+| **Attendance — clock span** | `Heure départ − Heure arrivée` | You want to include paid break time in the denominator — a stricter, site-occupancy view. |
+| **Calendar (7 h × weekdays)** | Fixed working day × working days in the period | Legacy behaviour. Charges every absent day against the technician, so it conflates absence with idleness. |
+
+Unaccounted time is deliberately treated as non-billable: not filling in the
+timesheet lowers the score rather than hiding it.
+
+Note that when logged segments exceed attendance (see *Timesheet integrity*), the
+denominator falls back to the logged total. That is conservative but distorted —
+fix the overlapping entries rather than reading the score.
+
+### Recovery funnel
+
+The fourth tab traces one paid hour through every stage where it can be lost:
+
+```
+Hours paid → Logged in segments → Billable-coded (20+30)
+           → Direct labour (20) → Carrying a WO number → Booked in Irium
+```
+
+The last drop is usually the largest and the most expensive: labour the technician
+logged against a work order that never reached the ERP. It is valued at
+`BILLING_RATE_EUR` (default €90/h).
+
+**Before acting on that figure, confirm the Irium labour export is not filtered to a
+single branch or department** — a filtered export produces the same symptom.
+
+### Timesheet integrity
+
+Activity segments should never exceed declared worked hours. Where they do, segments
+overlap or were entered twice. This is *not* overtime — overtime is flagged separately
+in `Dépassement horaire`, and the two do not correlate in practice. The integrity
+panel lists every offending technician-day so the form data can be corrected.
 
 Breaks (code `100`) and leave (`102`, `108`) are removed from the app calculation
 entirely, so a technician is neither credited nor penalised for them.
@@ -243,7 +290,8 @@ All settings live in a single block at the top of `Techapp.py`.
 | `APP_BILLABLE_CODES` | App activity codes that count as billable |
 | `APP_BREAK_CODES` | App codes removed as breaks |
 | `APP_LEAVE_CODES` | App codes removed as leave |
-| `STANDARD_DAY_HOURS` | Expected hours per working day (default `7.0`) |
+| `STANDARD_DAY_HOURS` | Fallback hours per working day for the calendar denominator (default `7.0`) |
+| `BILLING_RATE_EUR` | Rate used to value the recovery gap (default `90.0`) |
 
 ### Technician name consistency
 
@@ -272,6 +320,20 @@ reconciliation work permanently.
 ---
 
 ## Changelog
+
+### v3
+
+- **Attendance denominator.** The timesheet's arrival/departure/worked-hours columns
+  (3–7) were present and 100% populated but ignored by every prior version, which
+  assumed a flat 7 h day. Productivity is now measured against hours actually paid
+  for, selectable in the sidebar.
+- **Recovery funnel tab** tracing paid → logged → billable → direct → work-order →
+  booked, with the gap valued in euros.
+- **Timesheet integrity panel** listing technician-days where activity segments
+  exceed declared worked hours. These are overlapping or duplicated entries, not
+  overtime — overtime is separately flagged and does not explain them.
+- **Idle-time table** per technician: paid attendance covered by no activity segment.
+- Duration and category are computed once at load instead of per tab.
 
 ### v2
 

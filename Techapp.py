@@ -70,6 +70,14 @@ APP_BREAK_CODES = {"100"}           # Pause
 APP_LEAVE_CODES = {"108", "102"}    # Conge paye, RCC - excluded from expected hrs
 
 STANDARD_DAY_HOURS = 7.0
+BILLING_RATE_EUR = 90.0          # used to value the recovery gap
+
+# Attendance columns in the app timesheet - the "hours actually paid for".
+ATT_ARRIVAL = "Heure arrivee"
+ATT_DEPARTURE = "Heure depart"
+ATT_WORKED = "Heures travaillees"     # declared worked hours, format "7h15"
+ATT_OVERTIME = "Depassement horaire"
+ATT_LATE = "Retard (min)"
 
 # Column fingerprints used to recognise a file
 APP_REQUIRED = ["Date", "Technicien", "Activite - Debut", "Activite - Fin", "Code"]
@@ -160,6 +168,60 @@ def expected_hours(dmin, dmax, year, month, week):
     return float((cal["Date"].dt.dayofweek < 5).sum() * STANDARD_DAY_HOURS)
 
 
+def parse_hm(value):
+    """'7h15' -> 7.25. Also accepts plain numbers."""
+    text = str(value).strip().lower()
+    if "h" in text:
+        head, _, tail = text.partition("h")
+        try:
+            return int(head) + (int(tail) / 60 if tail.strip() else 0)
+        except ValueError:
+            return np.nan
+    try:
+        return float(text)
+    except ValueError:
+        return np.nan
+
+
+def build_attendance(df):
+    """One row per technician-day: what the company actually paid for.
+
+    declared_h  - the technician's own 'Heures travaillees' (span minus breaks)
+    span_h      - departure minus arrival, the full clock window
+    segment_h   - activity segments net of breaks and leave
+    overrun_h   - segment_h beyond declared_h; >0 means overlapping entries,
+                  NOT overtime (overtime is flagged separately)
+    """
+    c_arr, c_dep = find_col(df, ATT_ARRIVAL), find_col(df, ATT_DEPARTURE)
+    c_work, c_ot = find_col(df, ATT_WORKED), find_col(df, ATT_OVERTIME)
+    c_late = find_col(df, ATT_LATE)
+
+    keep = ["Technicien", "Date_Parsed"] + [c for c in (c_arr, c_dep, c_work, c_ot, c_late) if c]
+    day = df[keep].drop_duplicates(["Technicien", "Date_Parsed"]).copy()
+
+    day["declared_h"] = day[c_work].map(parse_hm) if c_work else np.nan
+
+    if c_arr and c_dep:
+        base = day["Date_Parsed"].dt.strftime("%Y-%m-%d")
+        arr = pd.to_datetime(base + " " + day[c_arr].astype(str), errors="coerce")
+        dep = pd.to_datetime(base + " " + day[c_dep].astype(str), errors="coerce")
+        span = (dep - arr).dt.total_seconds() / 3600.0
+        day["span_h"] = span.where(span >= 0, span + 24)
+    else:
+        day["span_h"] = np.nan
+
+    day["overtime_flag"] = day[c_ot].astype(str).str.strip().str.lower().eq("oui") if c_ot else False
+    day["late_min"] = pd.to_numeric(day[c_late], errors="coerce").fillna(0) if c_late else 0.0
+
+    productive = df[~df["Category"].isin(["Break", "Leave"])]
+    seg = productive.groupby(["Technicien", "Date_Parsed"])["Duration_Hours"].sum().rename("segment_h")
+    day = day.merge(seg, on=["Technicien", "Date_Parsed"], how="left")
+    day["segment_h"] = day["segment_h"].fillna(0)
+    day["overrun_h"] = np.maximum(0, day["segment_h"] - day["declared_h"])
+    day["idle_h"] = np.maximum(0, day["declared_h"] - day["segment_h"])
+    return day
+
+
 def classify_erp(group_value, hour_type):
     try:
         grp = int(float(group_value))
@@ -206,7 +268,7 @@ uploads = st.sidebar.file_uploader(
          "technician-hours export (ERP). The app identifies each file by its columns.",
 )
 
-app_df = erp_df = None
+app_df = erp_df = app_att = None
 reports = []
 
 for up in uploads or []:
@@ -237,7 +299,20 @@ for up in uploads or []:
         bad_dates = int(df["Date_Parsed"].isna().sum())
         df = df[df["Date_Parsed"].notna()].copy()
         df["Name_Key"] = df["Technicien"].map(name_key)
+
+        c_start, c_end = find_col(df, "Activite - Debut"), find_col(df, "Activite - Fin")
+        c_code, c_or = find_col(df, "Code"), find_col(df, "Numero OR - Main d oeuvre")
+        base = df["Date_Parsed"].dt.strftime("%Y-%m-%d")
+        start = pd.to_datetime(base + " " + df[c_start].astype(str), errors="coerce")
+        end = pd.to_datetime(base + " " + df[c_end].astype(str), errors="coerce")
+        dur = (end - start).dt.total_seconds() / 3600.0
+        df["Duration_Hours"] = dur.where(dur >= 0, dur + 24).fillna(0)
+        df["Category"] = df[c_code].map(classify_app)
+        df["Code_Clean"] = df[c_code].astype(str).str.replace(r"\.0$", "", regex=True)
+        df["Has_WO"] = df[c_or].notna() if c_or else False
+
         app_df = df
+        app_att = build_attendance(df)
         note = f"App timesheet - {len(df)} activity rows, {df['Technicien'].nunique()} technicians, " \
                f"{df['Date_Parsed'].min():%d/%m/%Y} to {df['Date_Parsed'].max():%d/%m/%Y}."
         if bad_dates:
@@ -302,6 +377,15 @@ sel_year = st.sidebar.selectbox("Year", ["Total"] + sorted(y for y in years if y
 sel_month = st.sidebar.selectbox("Month", ["Total"] + sorted((m for m in months if m != "Unknown"), key=int))
 sel_week = st.sidebar.selectbox("Week", ["Total"] + sorted((w for w in weeks if w != "Unknown"), key=int))
 
+st.sidebar.header("Denominator")
+denominator = st.sidebar.radio(
+    "Hours paid for",
+    ["Attendance - declared", "Attendance - clock span", f"Calendar ({STANDARD_DAY_HOURS:g} h x weekdays)"],
+    help="Attendance uses the technician's own arrival/departure record, so the "
+         "denominator is the time you actually paid for on the days they attended. "
+         "Calendar assumes a fixed working day and charges absent days against them.",
+)
+
 st.sidebar.header("Technicians")
 excluded = st.sidebar.multiselect(
     "Exclude", options=sorted(techs),
@@ -331,7 +415,8 @@ if app_df is None and erp_df is None:
     st.info("Upload your files in the sidebar. Both can be dropped at once - the app sorts them out.")
     st.stop()
 
-tab_app, tab_erp, tab_cmp = st.tabs(["Self-reported (App)", "Official ERP (Irium)", "App vs ERP"])
+tab_app, tab_erp, tab_cmp, tab_fun = st.tabs(
+    ["Self-reported (App)", "Official ERP (Irium)", "App vs ERP", "Recovery funnel"])
 
 # ============================================================================
 # TAB 1 - APP
@@ -342,25 +427,23 @@ with tab_app:
         st.warning("No App timesheet loaded.")
     else:
         d = app_df.copy()
-        c_start, c_end = find_col(d, "Activite - Debut"), find_col(d, "Activite - Fin")
-        c_code = find_col(d, "Code")
-        c_or = find_col(d, "Numero OR - Main d oeuvre")
-
-        base = d["Date_Parsed"].dt.strftime("%Y-%m-%d")
-        start = pd.to_datetime(base + " " + d[c_start].astype(str), errors="coerce")
-        end = pd.to_datetime(base + " " + d[c_end].astype(str), errors="coerce")
-        dur = (end - start).dt.total_seconds() / 3600.0
-        dur = dur.where(dur >= 0, dur + 24).fillna(0)
-        d["Duration_Hours"] = dur
-        d["Category"] = d[c_code].map(classify_app)
-        d["Work_Order"] = (d[c_or].astype(str).replace(["nan", "", "None", "NaT"], "No Work Order")
-                           if c_or else "No Work Order")
-
         f = apply_filters(d)
         work = f[~f["Category"].isin(["Break", "Leave"])]
 
+        att = app_att.merge(d[["Technicien", "Date_Parsed", "Year", "Month", "Week", "Name_Key"]]
+                            .drop_duplicates(["Technicien", "Date_Parsed"]),
+                            on=["Technicien", "Date_Parsed"], how="left")
+        att_f = apply_filters(att)
+
         baseline = expected_hours(d["Date_Parsed"].min(), d["Date_Parsed"].max(),
                                   sel_year, sel_month, sel_week)
+
+        if denominator.startswith("Attendance - declared"):
+            paid = att_f.groupby("Technicien")["declared_h"].sum()
+        elif denominator.startswith("Attendance - clock"):
+            paid = att_f.groupby("Technicien")["span_h"].sum()
+        else:
+            paid = None
 
         roster = [t for t in d["Technicien"].dropna().unique() if name_key(t) not in excluded_keys]
         agg = (work.groupby("Technicien")
@@ -373,8 +456,12 @@ with tab_app:
                pd.DataFrame(columns=["Technicien", "Total Logged Hours", "Billable Hours", "Non-Billable Hours"]))
 
         app_summary = pd.merge(pd.DataFrame({"Technicien": roster}), agg, on="Technicien", how="left").fillna(0)
-        app_summary["Expected Hours"] = baseline
-        app_summary["Unreported Hours"] = np.maximum(0, baseline - app_summary["Total Logged Hours"])
+        if paid is not None:
+            app_summary["Expected Hours"] = app_summary["Technicien"].map(paid).fillna(0)
+        else:
+            app_summary["Expected Hours"] = baseline
+        app_summary["Unreported Hours"] = np.maximum(
+            0, app_summary["Expected Hours"] - app_summary["Total Logged Hours"])
         app_summary["Effective Total Hours"] = app_summary["Total Logged Hours"] + app_summary["Unreported Hours"]
         app_summary["Productivity (%)"] = np.where(
             app_summary["Effective Total Hours"] > 0,
@@ -382,12 +469,14 @@ with tab_app:
         app_summary["Name_Key"] = app_summary["Technicien"].map(name_key)
         app_summary = app_summary.sort_values("Productivity (%)", ascending=False)
 
+        st.caption(f"Denominator: **{denominator}**. Productivity = billable hours divided by the "
+                   "hours paid for, so time neither logged nor billed counts against the score.")
         eff = app_summary["Effective Total Hours"].sum()
         cols = st.columns(5)
-        cols[0].metric("Expected", f"{app_summary['Expected Hours'].sum():.1f} h")
+        cols[0].metric("Hours paid", f"{app_summary['Expected Hours'].sum():.1f} h")
         cols[1].metric("Logged", f"{app_summary['Total Logged Hours'].sum():.1f} h")
         cols[2].metric("Billable", f"{app_summary['Billable Hours'].sum():.1f} h")
-        cols[3].metric("Unreported", f"{app_summary['Unreported Hours'].sum():.1f} h")
+        cols[3].metric("Unaccounted", f"{app_summary['Unreported Hours'].sum():.1f} h")
         cols[4].metric("Team productivity",
                        f"{(app_summary['Billable Hours'].sum() / eff * 100) if eff else 0:.1f} %")
 
@@ -407,10 +496,12 @@ with tab_app:
             fig2.update_traces(textposition="outside")
             st.plotly_chart(fig2, use_container_width=True)
 
+        c_lib = find_col(f, "Libelle activite")
         with st.expander("Activity code breakdown"):
-            st.dataframe(
-                f.groupby([c_code, find_col(f, "Libelle activite") or c_code])["Duration_Hours"]
-                 .sum().round(2).reset_index(), use_container_width=True)
+            keys = ["Code_Clean"] + ([c_lib] if c_lib else [])
+            st.dataframe(f.groupby(keys)["Duration_Hours"].sum().round(2)
+                         .reset_index().sort_values("Duration_Hours", ascending=False),
+                         use_container_width=True)
 
 # ============================================================================
 # TAB 2 - ERP
@@ -526,3 +617,110 @@ with tab_cmp:
         st.plotly_chart(px.bar(melted, x="Technician", y="Hours", color="Source",
                                barmode="group", title="Billable hours: app vs ERP"),
                         use_container_width=True)
+
+# ============================================================================
+# TAB 4 - RECOVERY FUNNEL
+# ============================================================================
+with tab_fun:
+    if app_df is None:
+        st.warning("Upload the App timesheet to build the funnel.")
+    else:
+        d = apply_filters(app_df)
+        att = app_att.merge(app_df[["Technicien", "Date_Parsed", "Year", "Month", "Week", "Name_Key"]]
+                            .drop_duplicates(["Technicien", "Date_Parsed"]),
+                            on=["Technicien", "Date_Parsed"], how="left")
+        att = apply_filters(att)
+
+        paid_h = att["declared_h"].sum()
+        span_h = att["span_h"].sum()
+        productive = d[~d["Category"].isin(["Break", "Leave"])]
+        logged_h = productive["Duration_Hours"].sum()
+        billable_h = d.loc[d["Category"] == "Billable", "Duration_Hours"].sum()
+        direct_h = d.loc[d["Code_Clean"] == "20", "Duration_Hours"].sum()
+        wo_h = d.loc[(d["Code_Clean"] == "20") & (d["Has_WO"]), "Duration_Hours"].sum()
+
+        booked_h = np.nan
+        if erp_df is not None:
+            e = apply_filters(erp_df)
+            c_hours = find_col(e, "Time carried out") or find_col(e, "Duration")
+            booked_h = pd.to_numeric(e[c_hours], errors="coerce").fillna(0).sum()
+
+        st.subheader("Where the paid hour goes")
+        st.caption("Each step is a place hours can be lost. The last two steps are where the "
+                   "money is: direct labour that never got a work order number, and work-order "
+                   "labour that never reached Irium.")
+
+        steps = [
+            ("Hours paid (declared attendance)", paid_h),
+            ("Logged in activity segments", logged_h),
+            ("Billable-coded (20 + 30)", billable_h),
+            ("Direct labour only (20)", direct_h),
+            ("Direct labour carrying a WO number", wo_h),
+        ]
+        if not np.isnan(booked_h):
+            steps.append(("Booked in Irium", booked_h))
+
+        fun = pd.DataFrame(steps, columns=["Stage", "Hours"])
+        fun["% of paid"] = np.where(paid_h > 0, fun["Hours"] / paid_h * 100, 0)
+        fun["Lost vs previous"] = fun["Hours"].shift(1) - fun["Hours"]
+
+        cols = st.columns(4)
+        cols[0].metric("Hours paid", f"{paid_h:.1f} h")
+        cols[1].metric("Clock span", f"{span_h:.1f} h")
+        if not np.isnan(booked_h):
+            cols[2].metric("Booked in Irium", f"{booked_h:.1f} h")
+            cols[3].metric("Recovery (booked / paid)",
+                           f"{booked_h / paid_h * 100 if paid_h else 0:.1f} %")
+        else:
+            cols[2].metric("Billable-coded", f"{billable_h:.1f} h")
+            cols[3].metric("Billable / paid", f"{billable_h / paid_h * 100 if paid_h else 0:.1f} %")
+
+        st.plotly_chart(
+            px.bar(fun, x="Hours", y="Stage", orientation="h",
+                   text=fun["Hours"].map("{:.0f} h".format),
+                   title="Recovery funnel").update_yaxes(autorange="reversed"),
+            use_container_width=True)
+        st.dataframe(fun.round(1), use_container_width=True)
+
+        if not np.isnan(booked_h) and wo_h > booked_h:
+            st.error(f"**{wo_h - booked_h:.1f} h** of work-order labour was logged in the app but "
+                     f"never booked in Irium - worth **EUR {(wo_h - booked_h) * BILLING_RATE_EUR:,.0f}** "
+                     f"at EUR {BILLING_RATE_EUR:g}/h. Confirm the Irium export is not filtered to a "
+                     "single branch or department before acting on this.")
+
+        st.markdown("---")
+        st.subheader("Timesheet integrity")
+        st.caption("Activity segments should never exceed declared worked hours. Where they do, "
+                   "segments overlap or were entered twice - it is not overtime, which is flagged "
+                   "separately in the timesheet.")
+
+        bad = att[att["overrun_h"] > 0.25].copy()
+        ic = st.columns(4)
+        ic[0].metric("Technician-days", f"{len(att)}")
+        ic[1].metric("Days with overrun", f"{len(bad)}")
+        ic[2].metric("Overrun hours", f"{att['overrun_h'].sum():.1f} h")
+        ic[3].metric("Overtime-flagged days", f"{int(att['overtime_flag'].sum())}")
+
+        if len(bad):
+            show = bad[["Technicien", "Date_Parsed", "span_h", "declared_h",
+                        "segment_h", "overrun_h", "overtime_flag"]].copy()
+            show["Date_Parsed"] = show["Date_Parsed"].dt.strftime("%d/%m/%Y")
+            show = show.rename(columns={"Date_Parsed": "Date", "span_h": "Clock span",
+                                        "declared_h": "Declared", "segment_h": "Segments",
+                                        "overrun_h": "Overrun", "overtime_flag": "Overtime flagged"})
+            st.dataframe(show.sort_values("Overrun", ascending=False).round(2),
+                         use_container_width=True)
+        else:
+            st.success("No segment overruns - the timesheet reconciles to attendance.")
+
+        st.markdown("---")
+        st.subheader("Idle time per technician")
+        st.caption("Paid attendance not covered by any activity segment.")
+        idle = att.groupby("Technicien").agg(
+            **{"Hours paid": ("declared_h", "sum"),
+               "Segments": ("segment_h", "sum"),
+               "Idle": ("idle_h", "sum"),
+               "Overrun": ("overrun_h", "sum"),
+               "Days": ("declared_h", "size")}).reset_index()
+        idle["Idle %"] = np.where(idle["Hours paid"] > 0, idle["Idle"] / idle["Hours paid"] * 100, 0)
+        st.dataframe(idle.sort_values("Idle", ascending=False).round(1), use_container_width=True)
