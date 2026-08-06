@@ -1,6 +1,22 @@
 """
-360 Technician Productivity Dashboard - v2
+360 Technician Productivity Dashboard - v3
 ==========================================
+Measures productivity against the hours actually paid for, not the hours a
+technician happened to write down.
+
+Changes vs v2:
+  * ATTENDANCE DENOMINATOR: the timesheet's arrival / departure / "Heures
+    travaillees" columns were 100% populated but ignored - v1 and v2 assumed a
+    flat 7 h day. Pick the denominator in the sidebar: declared attendance
+    (default), clock span, or the legacy calendar baseline.
+  * RECOVERY FUNNEL tab: paid -> logged -> billable (20+30) -> direct (20) ->
+    carrying a WO number -> booked in Irium, with the gap valued in euros.
+  * TIMESHEET INTEGRITY panel: technician-days where activity segments exceed
+    declared worked hours. These are overlapping or duplicated entries, NOT
+    overtime - overtime is flagged separately and does not explain them.
+  * IDLE TIME per technician: paid attendance covered by no activity segment.
+  * Duration and category are computed once at load instead of per tab.
+
 Changes vs v1:
   * AUTO-DETECT: one uploader, drop both files in any order. The app fingerprints
     each file by its columns and assigns it to the App or ERP slot itself.
